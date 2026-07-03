@@ -1,3 +1,13 @@
+## erlang-rocksdb 3.1.1, released on 2026/07/03
+
+### Upgrades
+
+- update vendored RocksDB to 11.1.2 (from 11.1.1)
+
+### Bug Fixes
+
+- fix the `blob_file_size` column family option: it was wrongly assigned to `min_blob_size` (#15)
+
 ## erlang-rocksdb 3.1.0, released on 2026/06/15
 
 ### New Features
