@@ -39,7 +39,7 @@ ok = rocksdb:batch_rollback(Batch),
 ?assertEqual(2, rocksdb:batch_count(Batch)),
 ?assertEqual([{put, <<"a">>, <<"v1">>},
             {put, <<"b">>, <<"v2">>}], rocksdb:batch_tolist(Batch)),
-ok = rocksdb:close_batch(Batch)
+ok = rocksdb:release_batch(Batch)
 ```
 
 This api allows you to rollback the records inside a batch from the last checkpont
