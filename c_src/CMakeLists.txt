@@ -200,6 +200,24 @@ if(WITH_ZSTD)
     endif()
 endif()
 
+# A failed find_path leaves <PKG>_INCLUDE_DIR set to "<PKG>_INCLUDE_DIR-NOTFOUND",
+# which CMake rejects as a relative include path at generate time. Only propagate
+# the paths that actually resolved. Both the system and the bundled paths set
+# <PKG>_FOUND, so it covers either case.
+set(COMPRESSION_INCLUDE_DIRS)
+set(COMPRESSION_LIBS)
+foreach(pkg ZSTD LZ4 SNAPPY)
+    if(${pkg}_FOUND)
+        list(APPEND COMPRESSION_INCLUDE_DIRS ${${pkg}_INCLUDE_DIR})
+    endif()
+endforeach()
+# snappy is linked separately below, see SNAPPY_LINK_LIBS
+foreach(pkg ZSTD LZ4)
+    if(${pkg}_FOUND)
+        list(APPEND COMPRESSION_LIBS ${${pkg}_LIBRARY})
+    endif()
+endforeach()
+
 
 option(WITH_TBB "build with Threading Building Blocks (TBB)" OFF)
 if(WITH_TBB)
@@ -235,11 +253,11 @@ include_directories(${ERLANG_EI_INCLUDE_PATH})
 include_directories(${ERLANG_ERTS_INCLUDE_PATH})
 #--------------------------------------------------------------------------------
 
-include_directories(${ZSTD_INCLUDE_DIR})
-include_directories(${LZ4_INCLUDE_DIR})
+if(COMPRESSION_INCLUDE_DIRS)
+    include_directories(${COMPRESSION_INCLUDE_DIRS})
+endif()
 include_directories(${BZIP2_INCLUDE_DIR})
 include_directories(${ZLIB_INCLUDE_DIR})
-include_directories(${SNAPPY_INCLUDE_DIR})
 include_directories(${ROCKSDB_INCLUDE_DIRS})
 if(WITH_CROARING)
     include_directories(${CROARING_INCLUDE_DIR})
@@ -308,9 +326,7 @@ target_include_directories(${ErlangRocksDBNIF_TARGET}
     PRIVATE
     ${DEFAULT_INCLUDE_DIRECTORIES}
     ${ROCKSDB_INCLUDE_DIR}
-    ${ZSTD_INCLUDE_DIR}
-    ${LZ4_INCLUDE_DIR}
-    ${SNAPPY_INCLUDE_DIR}
+    ${COMPRESSION_INCLUDE_DIRS}
     ${OPENSSL_INCLUDE_DIR}
     ${PROJECT_BINARY_DIR}
 )
@@ -329,7 +345,9 @@ endif(APPLE)
 
 # On Linux with bundled snappy, we need --whole-archive to include all symbols
 # including RTTI symbols that are needed at runtime but not directly referenced
-if(WITH_BUNDLE_SNAPPY AND NOT APPLE AND NOT MSVC)
+if(NOT SNAPPY_FOUND)
+    set(SNAPPY_LINK_LIBS "")
+elseif(WITH_BUNDLE_SNAPPY AND NOT APPLE AND NOT MSVC)
     # Handle snappy separately with whole-archive wrapper
     set(SNAPPY_LINK_LIBS "")
 else()
@@ -341,8 +359,7 @@ target_link_libraries(
     PRIVATE
     ${TARGET_LINKER_OPTIONS}
     ${ROCKSDB_LIBRARIES}
-    ${ZSTD_LIBRARY}
-    ${LZ4_LIBRARY}
+    ${COMPRESSION_LIBS}
     ${SNAPPY_LINK_LIBS}
     ${BZIP2_LIBRARIES}
     ${ZLIB_LIBRARY}

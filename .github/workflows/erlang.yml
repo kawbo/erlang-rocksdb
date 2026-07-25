@@ -56,6 +56,28 @@ jobs:
           version: 1.1
       - name: build
         run: rebar3 eunit
+  package:
+    # build the tree the way a hex consumer gets it: no .git, no system
+    # snappy/lz4 and no bundled overrides
+    runs-on: ubuntu-latest
+    env:
+      ERLANG_ROCKSDB_OPTS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27.2"
+          rebar3-version: "3.24.0"
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: cmake
+          version: 1.1
+      - name: build from a git-less packaged tree
+        run: |
+          mkdir -p /tmp/pkg
+          git archive HEAD | tar -x -C /tmp/pkg
+          cd /tmp/pkg
+          rebar3 compile
   macos:
     runs-on: macos-26
     strategy:
