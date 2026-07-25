@@ -6,9 +6,9 @@ Download the sources from our [Github repository](https://github.com/EnkiMultime
 
 To build the application simply run 'rebar3 compile'. 
 
-> Note: since the version **0.26.0**, `cmake>=3.4` is required to install `erlang-rocksdb`.
+> Note: `cmake>=3.12` is required to install `erlang-rocksdb`.
 
-To run tests run 'rebar3 eunit'. To generate doc, run 'rebar3 edoc'.
+To run tests run 'rebar3 eunit'. To generate doc, run 'rebar3 ex_doc'.
 
 Or add it to your rebar config
 
@@ -23,7 +23,7 @@ Or add it to your rebar config
 Or your mix config file:
 
 ```
-{:rocksdb, "~> 2.6"}
+{:rocksdb, "~> 3.1"}
 ```
 
 ## Basic operations
@@ -39,9 +39,9 @@ Options = [{create_if_missing, true}],
 
 ```
 
-This will create a nif resource. 
+This gives you a nif resource, the database handle.
 
-> Makes sure that the process that opened it will stay open across or the session (or that at least one process own it) to prevent any garbage collection of it which will close the database and kill all the resources related (iterators, column families) ...
+> Keep the handle reachable for as long as you need the database: hold it in a live process, in ETS or in `persistent_term`. Once nothing references it any more, it is garbage collected, which closes the database and everything tied to it (iterators, column families). See [OTP Integration](otp_integration.md) for where to keep it in an application.
 
 
 ### Closing a database
@@ -52,20 +52,20 @@ When you are done with a database run the following function
 ok = rocksdb:close(DB).
 ```
 
-> the database will be automatically closed if no process own it.
+> The database is also closed for you once nothing holds the handle any more.
 
 ### Read and Writes
 
-The library provides put, delete, and get methods to modify/query the database. For example, the following code moves the value stored under key1 to key2.
+You modify and query the database with `put`, `get` and `delete`. Each of them takes read or write options as its last argument, so pass `[]` when you have none. This writes a key, reads it back, then deletes it:
 
 ```erlang
-rocksdb:put(Db, <<"my key">>, <<"my value">>),
+ok = rocksdb:put(Db, <<"my key">>, <<"my value">>, []),
 case rocksdb:get(Db, <<"my key">>, []) of
-  {ok, Value} => io:format("retrieved value %p~n", [Value]);
-  not_found => io:format("value not found~n", []);
-  Error -> io:format("operational problem encountered: %p~n", [Error])
+  {ok, Value} -> io:format("retrieved value ~p~n", [Value]);
+  not_found -> io:format("value not found~n", []);
+  Error -> io:format("operational problem encountered: ~p~n", [Error])
 end,
-rocksdb:delete(Db, <<"my key">>).
+ok = rocksdb:delete(Db, <<"my key">>, []).
 ```
 
 ### Batch Reads with multi_get
@@ -105,18 +105,17 @@ rocksdb:release_snapshot(Snapshot).
 
 ### Atomic Updates
 
-Note that if the process dies after the Put of key2 but before the delete of key1, the same value may be left stored under multiple keys. Such problems can be avoided by using the function `rocksdb:write/3` class to atomically apply a set of updates:
+If your process dies between two writes, you can be left with the same value stored under several keys. Collect the writes in a batch and apply them in one atomic operation instead:
 
 ```erlang
-Batch = [
-  {put, <<"key1">>, <<"value1">>},
-  {delete, <<"keytodelete">>},
-  ...
-],
-rocksdb:write(DB, Batch, [])
+{ok, Batch} = rocksdb:batch(),
+ok = rocksdb:batch_put(Batch, <<"key1">>, <<"value1">>),
+ok = rocksdb:batch_delete(Batch, <<"keytodelete">>),
+ok = rocksdb:write_batch(Db, Batch, []),
+ok = rocksdb:release_batch(Batch).
 ```
 
-You can also use the [Batch API](batch_api.md) that gives you more control about the atomic transactions.
+See the [Batch API](batch_api.md) guide for savepoints, rollbacks and the other batch operations.
 
 ### Synchronous writes
 
@@ -129,7 +128,7 @@ You can start an iterator using the function `rocksdb:iterator/2` :
 
 ```erlang
 ItrOptions = [],
-{ok, Itr} = iterator(DB, ItrOptions)
+{ok, Itr} = rocksdb:iterator(DB, ItrOptions)
 ```
 
 You close the iterator using the function `rocksdb:iterator_close/1`:
@@ -137,7 +136,7 @@ You close the iterator using the function `rocksdb:iterator_close/1`:
 rocksdb:iterator_close(Itr)
 ```
 
-then you can move to the previous or next data using the function `iterator:move/2` :
+You move the iterator with `rocksdb:iterator_move/2`:
 
 * move to the next key: `rocksdb:iterator_move(Itr, next)`
 * move to the previous key: `rocksdb:iterator_move(Itr, prev)`
@@ -148,7 +147,7 @@ then you can move to the previous or next data using the function `iterator:move
 
 > An iterator doesn't support parallel operations, so make sure to use it accordingly.
 
-Prefix seek can be optimized by putting your database in "prefix seek" mode using  the option `prefix_extractor` for your DB or column family is specified. See the [Prefix Seek](prefix-seek.html) API for more information.
+You can optimize prefix seeks by putting your database in "prefix seek" mode with the `prefix_extractor` option on the database or the column family. See [Prefix Seek](prefix_seek.html) for more information.
 
 ### Wide-Column Entities
 
@@ -187,13 +186,13 @@ See [Wide-Column Entities](wide_column_entities.html) for more details.
 
 ### Snapshots
 
-Snapshots provide consistent read-only views over the entire state of the key-value store.The `{snapshot, Snapshot}` can be need to be set in the read options to indicate that a read should operate on a particular version of the DB state.
+Snapshots give you a consistent read-only view over the entire state of the key-value store. Set `{snapshot, Snapshot}` in the read options to make a read operate on that version of the database state.
 
 
 ```erlang
 {ok, Snapshot} = rocksdb:snapshot(Db),
 ReadOptions = [{snapshot, Snapshot}],
-{ok, Itr} = rocksdb:iterator(DB, ReadOptions),
+{ok, Itr} = rocksdb:iterator(Db, ReadOptions),
 ... read using iter to view the state when the snapshot was created ...
 rocksdb:iterator_close(Itr),
 rocksdb:release_snapshot(Snapshot)
@@ -222,7 +221,7 @@ Erlang RocksDB has preliminary support of multi-operation transactions. See [Tra
 
 ### SST File Operations
 
-Erlang RocksDB provides comprehensive support for working with SST (Sorted String Table) files, the core storage format of RocksDB. This enables bulk data loading, offline inspection, and data migration.
+You can work directly with SST (Sorted String Table) files, the storage format RocksDB uses, for bulk data loading, offline inspection and data migration.
 
 #### Creating SST Files
 
