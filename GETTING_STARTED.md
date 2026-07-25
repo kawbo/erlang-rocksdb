@@ -16,7 +16,7 @@ Or add it to your rebar config
 ```erlang
 {deps, [
     ....
-    {rocksdb, "3.1.1"}
+    {rocksdb, "3.1.2"}
 ]}.
 ```
 

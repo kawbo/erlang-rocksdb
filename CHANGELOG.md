@@ -1,3 +1,15 @@
+## erlang-rocksdb 3.1.2, released on 2026/07/25
+
+### Bug Fixes
+
+- fix the build of the hex package: the `git submodule update` compile hook aborted it outside a git checkout (#17)
+- stop passing unresolved Snappy, LZ4 and Zstd paths to the compiler when no system library is found, which failed the cmake generate step (#17)
+
+### Documentation
+
+- fix the snippets of the getting started and batch guides, they called functions that do not exist (#18)
+- add an OTP integration guide: where to keep the database handle in an application (#18)
+
 ## erlang-rocksdb 3.1.1, released on 2026/07/03
 
 ### Upgrades
