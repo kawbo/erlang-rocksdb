@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------
-// Copyright (c) 2016-2022 Benoit Chesneau. All Rights Reserved.
+// Copyright (c) 2016-2026 Benoit Chesneau. All Rights Reserved.
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -26,6 +26,7 @@
 #include "rocksdb/comparator.h"
 #include "rocksdb/write_batch.h"
 #include "rocksdb/slice_transform.h"
+#include "rocksdb/wide_columns.h"
 
 #include "atoms.h"
 #include "erl_nif.h"
@@ -82,7 +83,12 @@ parse_iterator_options(
                 ERL_NIF_TERM lower_bound = enif_make_copy(itr_env, option[1]);
                 ErlNifBinary lower_bound_bin;
                 if(!enif_inspect_binary(itr_env, lower_bound, &lower_bound_bin))
+                {
+                    // Clean up already allocated upper_bound_slice
+                    delete bounds.upper_bound_slice;
+                    bounds.upper_bound_slice = nullptr;
                     return 0;
+                }
                 bounds.lower_bound_slice = new rocksdb::Slice(
                         reinterpret_cast<char*>(lower_bound_bin.data),
                         lower_bound_bin.size);
@@ -100,10 +106,31 @@ parse_iterator_options(
                 snapshot_ptr.assign(erocksdb::SnapshotObject::RetrieveSnapshotObject(env, option[1]));
 
                 if(NULL==snapshot_ptr.get())
+                {
+                    // Clean up already allocated bound slices
+                    delete bounds.upper_bound_slice;
+                    delete bounds.lower_bound_slice;
+                    bounds.upper_bound_slice = nullptr;
+                    bounds.lower_bound_slice = nullptr;
                     return 0;
+                }
 
                 opts.snapshot = snapshot_ptr->m_Snapshot;
             }
+            else if (option[0] == erocksdb::ATOM_AUTO_REFRESH_ITERATOR_WITH_SNAPSHOT)
+                opts.auto_refresh_iterator_with_snapshot = (option[1] == erocksdb::ATOM_TRUE);
+            else if (option[0] == erocksdb::ATOM_AUTO_READAHEAD_SIZE)
+                opts.auto_readahead_size = (option[1] == erocksdb::ATOM_TRUE);
+            else if (option[0] == erocksdb::ATOM_ALLOW_UNPREPARED_VALUE)
+                opts.allow_unprepared_value = (option[1] == erocksdb::ATOM_TRUE);
+            else if (option[0] == erocksdb::ATOM_READAHEAD_SIZE)
+            {
+                ErlNifUInt64 readahead_size;
+                if (enif_get_uint64(env, option[1], &readahead_size))
+                    opts.readahead_size = static_cast<size_t>(readahead_size);
+            }
+            else if (option[0] == erocksdb::ATOM_ASYNC_IO)
+                opts.async_io = (option[1] == erocksdb::ATOM_TRUE);
         }
     }
     return 1;
@@ -138,13 +165,15 @@ Iterator(
 
     ItrObject * itr_ptr;
     rocksdb::Iterator * iterator;
+    ReferencePtr<ColumnFamilyObject> cf_ptr;
 
     if(argc==3)
     {
-        ReferencePtr<ColumnFamilyObject> cf_ptr;
         if(!enif_get_cf(env, argv[1], &cf_ptr))
         {
             delete opts;
+            delete bounds.upper_bound_slice;
+            delete bounds.lower_bound_slice;
             return enif_make_badarg(env);
         }
         iterator = db_ptr->m_Db->NewIterator(*opts, cf_ptr->m_ColumnFamily);
@@ -155,6 +184,11 @@ Iterator(
     }
 
     itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterator);
+
+    // pin the column family so GC of its handle cannot free it while this
+    // iterator is still using it
+    if(cf_ptr.get() != nullptr)
+        itr_ptr->KeepResource(cf_ptr.get());
 
     if(bounds.upper_bound_slice != nullptr)
     {
@@ -204,6 +238,12 @@ Iterators(
         ReferencePtr<ColumnFamilyObject> cf_ptr;
         cf_ptr.assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, head));
         ColumnFamilyObject* cf = cf_ptr.get();
+        if(NULL == cf)
+        {
+            delete bounds.upper_bound_slice;
+            delete bounds.lower_bound_slice;
+            return enif_make_badarg(env);
+        }
         column_families.push_back(cf->m_ColumnFamily);
     }
 
@@ -213,30 +253,111 @@ Iterators(
 
     ERL_NIF_TERM result = enif_make_list(env, 0);
     ItrObject * itr_ptr;
+    bool exception_occurred = false;
     try {
         for (size_t i = 0; i < iterators.size(); i++) {
             itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterators[i]);
 
+            // Clone slices for each iterator so each has independent ownership
             if(bounds.upper_bound_slice != nullptr)
             {
-                itr_ptr->SetUpperBoundSlice(bounds.upper_bound_slice);
+                rocksdb::Slice* upper_clone = new rocksdb::Slice(
+                    bounds.upper_bound_slice->data(), bounds.upper_bound_slice->size());
+                itr_ptr->SetUpperBoundSlice(upper_clone);
             }
 
             if(bounds.lower_bound_slice != nullptr)
             {
-                itr_ptr->SetLowerBoundSlice(bounds.lower_bound_slice);
+                rocksdb::Slice* lower_clone = new rocksdb::Slice(
+                    bounds.lower_bound_slice->data(), bounds.lower_bound_slice->size());
+                itr_ptr->SetLowerBoundSlice(lower_clone);
             }
             ERL_NIF_TERM itr_res = enif_make_resource(env, itr_ptr);
             result = enif_make_list_cell(env, itr_res, result);
             enif_release_resource(itr_ptr);
         }
     } catch (const std::exception&) {
-        // pass through and return nullptr
+        exception_occurred = true;
     }
+
+    // Clean up original bounds after all iterators are created with clones
+    delete bounds.upper_bound_slice;
+    delete bounds.lower_bound_slice;
+
+    if (exception_occurred)
+    {
+        return error_tuple(env, ATOM_ERROR, "iterator creation failed");
+    }
+
     ERL_NIF_TERM result_out;
     enif_make_reverse_list(env, result, &result_out);
 
     return enif_make_tuple2(env, erocksdb::ATOM_OK, result_out);
+}
+
+ERL_NIF_TERM
+CoalescingIterator(
+    ErlNifEnv* env,
+    int /*argc*/,
+    const ERL_NIF_TERM argv[])
+{
+    ReferencePtr<DbObject> db_ptr;
+    if(!enif_get_db(env, argv[0], &db_ptr))
+        return enif_make_badarg(env);
+
+    if(!enif_is_list(env, argv[1]) || !enif_is_list(env, argv[2]))
+       return enif_make_badarg(env);
+
+    rocksdb::ReadOptions opts;
+    ItrBounds bounds;
+    auto itr_env = std::make_shared<ErlEnvCtr>();
+    if (!parse_iterator_options(env, itr_env->env, argv[2], opts, bounds))
+    {
+        delete bounds.upper_bound_slice;
+        delete bounds.lower_bound_slice;
+        return enif_make_badarg(env);
+    }
+
+    std::vector<rocksdb::ColumnFamilyHandle*> column_families;
+    ERL_NIF_TERM head, tail = argv[1];
+    while(enif_get_list_cell(env, tail, &head, &tail))
+    {
+        ReferencePtr<ColumnFamilyObject> cf_ptr;
+        cf_ptr.assign(ColumnFamilyObject::RetrieveColumnFamilyObject(env, head));
+        if(NULL == cf_ptr.get())
+        {
+            delete bounds.upper_bound_slice;
+            delete bounds.lower_bound_slice;
+            return enif_make_badarg(env);
+        }
+        column_families.push_back(cf_ptr->m_ColumnFamily);
+    }
+
+    std::unique_ptr<rocksdb::Iterator> iterator =
+        db_ptr->m_Db->NewCoalescingIterator(opts, column_families);
+
+    if (!iterator) {
+        delete bounds.upper_bound_slice;
+        delete bounds.lower_bound_slice;
+        rocksdb::Status status = rocksdb::Status::NotSupported("CoalescingIterator not available");
+        return error_tuple(env, ATOM_ERROR, status);
+    }
+
+    ItrObject* itr_ptr = ItrObject::CreateItrObject(db_ptr.get(), itr_env, iterator.release());
+
+    if(bounds.upper_bound_slice != nullptr)
+    {
+        itr_ptr->SetUpperBoundSlice(bounds.upper_bound_slice);
+    }
+
+    if(bounds.lower_bound_slice != nullptr)
+    {
+        itr_ptr->SetLowerBoundSlice(bounds.lower_bound_slice);
+    }
+
+    ERL_NIF_TERM result = enif_make_resource(env, itr_ptr);
+    enif_release_resource(itr_ptr);
+    return enif_make_tuple2(env, ATOM_OK, result);
 }
 
 ERL_NIF_TERM
@@ -353,6 +474,39 @@ IteratorRefresh(
 }   // erocksdb::IteratorRefresh
 
 ERL_NIF_TERM
+IteratorPrepareValue(
+    ErlNifEnv* env,
+    int /*argc*/,
+    const ERL_NIF_TERM argv[])
+{
+    const ERL_NIF_TERM& itr_handle_ref = argv[0];
+
+    ReferencePtr<ItrObject> itr_ptr;
+    itr_ptr.assign(ItrObject::RetrieveItrObject(env, itr_handle_ref));
+
+    if(NULL==itr_ptr.get())
+    {
+        return enif_make_badarg(env);
+    }
+
+    rocksdb::Iterator* itr = itr_ptr->m_Iterator;
+
+    if(!itr->Valid())
+    {
+        return enif_make_tuple2(env, ATOM_ERROR, ATOM_INVALID_ITERATOR);
+    }
+
+    if(!itr->PrepareValue())
+    {
+        rocksdb::Status status = itr->status();
+        return error_tuple(env, ATOM_ERROR, status);
+    }
+
+    return(ATOM_OK);
+
+}   // erocksdb::IteratorPrepareValue
+
+ERL_NIF_TERM
 IteratorClose(
     ErlNifEnv* env,
     int /*argc*/,
@@ -375,5 +529,55 @@ IteratorClose(
     }   // else
 
 }   // erocksdb:IteratorClose
+
+ERL_NIF_TERM
+IteratorColumns(
+    ErlNifEnv* env,
+    int /*argc*/,
+    const ERL_NIF_TERM argv[])
+{
+    const ERL_NIF_TERM& itr_handle_ref = argv[0];
+
+    ReferencePtr<ItrObject> itr_ptr;
+    itr_ptr.assign(ItrObject::RetrieveItrObject(env, itr_handle_ref));
+
+    if(NULL==itr_ptr.get())
+    {
+        return enif_make_badarg(env);
+    }
+
+    rocksdb::Iterator* itr = itr_ptr->m_Iterator;
+
+    if(!itr->Valid())
+    {
+        return enif_make_tuple2(env, ATOM_ERROR, ATOM_INVALID_ITERATOR);
+    }
+
+    rocksdb::Status status = itr->status();
+    if(!status.ok())
+    {
+        return error_tuple(env, ATOM_ERROR, status);
+    }
+
+    // Get columns from iterator
+    const rocksdb::WideColumns& cols = itr->columns();
+
+    // Build result list: [{Name, Value}, ...]
+    ERL_NIF_TERM result_list = enif_make_list(env, 0);
+
+    // Build in reverse order (since we prepend)
+    for (auto it = cols.rbegin(); it != cols.rend(); ++it)
+    {
+        ERL_NIF_TERM name_bin, value_bin;
+        memcpy(enif_make_new_binary(env, it->name().size(), &name_bin),
+               it->name().data(), it->name().size());
+        memcpy(enif_make_new_binary(env, it->value().size(), &value_bin),
+               it->value().data(), it->value().size());
+        ERL_NIF_TERM tuple = enif_make_tuple2(env, name_bin, value_bin);
+        result_list = enif_make_list_cell(env, tuple, result_list);
+    }
+
+    return enif_make_tuple2(env, ATOM_OK, result_list);
+}   // erocksdb::IteratorColumns
 
 }

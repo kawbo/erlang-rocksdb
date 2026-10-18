@@ -1,7 +1,7 @@
 
 // -------------------------------------------------------------------
 // Copyright (c) 2011-2013 Basho Technologies, Inc. All Rights Reserved.
-// Copyright (c) 2016-2022 Benoit Chesneau. All Rights Reserved.
+// Copyright (c) 2016-2026 Benoit Chesneau. All Rights Reserved.
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -49,6 +49,13 @@ rocksdb::Status& status)
 
     ERL_NIF_TERM reason = enif_make_string(env, status.ToString().c_str(),
                                            ERL_NIF_LATIN1);
+    return enif_make_tuple2(env, erocksdb::ATOM_ERROR,
+                            enif_make_tuple2(env, error, reason));
+}
+
+ERL_NIF_TERM error_tuple(ErlNifEnv* env, ERL_NIF_TERM error, const char* msg)
+{
+    ERL_NIF_TERM reason = enif_make_string(env, msg, ERL_NIF_LATIN1);
     return enif_make_tuple2(env, erocksdb::ATOM_ERROR,
                             enif_make_tuple2(env, error, reason));
 }

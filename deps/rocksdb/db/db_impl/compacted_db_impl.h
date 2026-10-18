@@ -22,7 +22,7 @@ class CompactedDBImpl : public DBImpl {
   ~CompactedDBImpl() override;
 
   static Status Open(const Options& options, const std::string& dbname,
-                     DB** dbptr);
+                     std::unique_ptr<DB>* dbptr);
 
   // Implementations of the DB interface
   using DB::Get;
@@ -143,5 +143,6 @@ class CompactedDBImpl : public DBImpl {
   Version* version_;
   const Comparator* user_comparator_;
   LevelFilesBrief files_;
+  int files_level_{0};
 };
 }  // namespace ROCKSDB_NAMESPACE

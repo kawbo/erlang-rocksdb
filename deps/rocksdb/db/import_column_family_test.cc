@@ -4,7 +4,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include <functional>
 
 #include "db/db_test_util.h"
@@ -372,7 +371,7 @@ TEST_F(ImportColumnFamilyTest, ImportExportedSSTFromAnotherCF) {
   ASSERT_OK(Flush(1));
 
   Checkpoint* checkpoint;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
   ASSERT_OK(checkpoint->ExportColumnFamily(handles_[1], export_files_dir_,
                                            &metadata_ptr_));
   ASSERT_NE(metadata_ptr_, nullptr);
@@ -482,14 +481,14 @@ TEST_F(ImportColumnFamilyTest, ImportExportedSSTFromAnotherDB) {
   ASSERT_OK(Flush(1));
 
   Checkpoint* checkpoint;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
   ASSERT_OK(checkpoint->ExportColumnFamily(handles_[1], export_files_dir_,
                                            &metadata_ptr_));
   ASSERT_NE(metadata_ptr_, nullptr);
   delete checkpoint;
 
   // Create a new db and import the files.
-  DB* db_copy;
+  std::unique_ptr<DB> db_copy;
   ASSERT_OK(DestroyDir(env_, dbname_ + "/db_copy"));
   ASSERT_OK(DB::Open(options, dbname_ + "/db_copy", &db_copy));
   ColumnFamilyHandle* cfh = nullptr;
@@ -505,7 +504,7 @@ TEST_F(ImportColumnFamilyTest, ImportExportedSSTFromAnotherDB) {
   }
   ASSERT_OK(db_copy->DropColumnFamily(cfh));
   ASSERT_OK(db_copy->DestroyColumnFamilyHandle(cfh));
-  delete db_copy;
+  db_copy.reset();
   ASSERT_OK(DestroyDir(env_, dbname_ + "/db_copy"));
 }
 
@@ -530,7 +529,7 @@ TEST_F(ImportColumnFamilyTest,
   ASSERT_OK(db_->DeleteRange(WriteOptions(), handles_[1], Key(0), Key(2)));
 
   Checkpoint* checkpoint;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
   ASSERT_OK(checkpoint->ExportColumnFamily(handles_[1], export_files_dir_,
                                            &metadata_ptr_));
   ASSERT_NE(metadata_ptr_, nullptr);
@@ -606,14 +605,14 @@ TEST_F(ImportColumnFamilyTest, LevelFilesOverlappingAtEndpoints) {
   ASSERT_GT(NumTableFilesAtLevel(1, 1), 1);
 
   Checkpoint* checkpoint;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
   ASSERT_OK(checkpoint->ExportColumnFamily(handles_[1], export_files_dir_,
                                            &metadata_ptr_));
   ASSERT_NE(metadata_ptr_, nullptr);
   delete checkpoint;
 
   // Create a new db and import the files.
-  DB* db_copy;
+  std::unique_ptr<DB> db_copy;
   ASSERT_OK(DestroyDir(env_, dbname_ + "/db_copy"));
   ASSERT_OK(DB::Open(options, dbname_ + "/db_copy", &db_copy));
   ColumnFamilyHandle* cfh = nullptr;
@@ -628,7 +627,7 @@ TEST_F(ImportColumnFamilyTest, LevelFilesOverlappingAtEndpoints) {
   }
   ASSERT_OK(db_copy->DropColumnFamily(cfh));
   ASSERT_OK(db_copy->DestroyColumnFamilyHandle(cfh));
-  delete db_copy;
+  db_copy.reset();
   ASSERT_OK(DestroyDir(env_, dbname_ + "/db_copy"));
   for (const Snapshot* snapshot : snapshots) {
     db_->ReleaseSnapshot(snapshot);
@@ -772,12 +771,12 @@ TEST_F(ImportColumnFamilyTest, ImportMultiColumnFamilyTest) {
 
   Checkpoint* checkpoint1;
   Checkpoint* checkpoint2;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint1));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint1));
   ASSERT_OK(checkpoint1->ExportColumnFamily(handles_[1], export_files_dir_,
                                             &metadata_ptr_));
 
   // Create a new db and import the files.
-  DB* db_copy;
+  std::unique_ptr<DB> db_copy;
   ASSERT_OK(DestroyDir(env_, dbname_ + "/db_copy"));
   ASSERT_OK(DB::Open(options, dbname_ + "/db_copy", &db_copy));
   ColumnFamilyHandle* copy_cfh = nullptr;
@@ -797,7 +796,7 @@ TEST_F(ImportColumnFamilyTest, ImportMultiColumnFamilyTest) {
   ASSERT_OK(db_copy->Flush(FlushOptions()));
 
   // Flush again to create another L0 file. It should have higher sequencer.
-  ASSERT_OK(Checkpoint::Create(db_copy, &checkpoint2));
+  ASSERT_OK(Checkpoint::Create(db_copy.get(), &checkpoint2));
   ASSERT_OK(checkpoint2->ExportColumnFamily(copy_cfh, export_files_dir2_,
                                             &metadata_ptr2_));
 
@@ -827,7 +826,7 @@ TEST_F(ImportColumnFamilyTest, ImportMultiColumnFamilyTest) {
 
   ASSERT_OK(db_copy->DropColumnFamily(copy_cfh));
   ASSERT_OK(db_copy->DestroyColumnFamilyHandle(copy_cfh));
-  delete db_copy;
+  db_copy.reset();
   ASSERT_OK(DestroyDir(env_, dbname_ + "/db_copy"));
 }
 
@@ -841,12 +840,12 @@ TEST_F(ImportColumnFamilyTest, ImportMultiColumnFamilyWithOverlap) {
 
   Checkpoint* checkpoint1;
   Checkpoint* checkpoint2;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint1));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint1));
   ASSERT_OK(checkpoint1->ExportColumnFamily(handles_[1], export_files_dir_,
                                             &metadata_ptr_));
 
   // Create a new db and import the files.
-  DB* db_copy;
+  std::unique_ptr<DB> db_copy;
   ASSERT_OK(DestroyDir(env_, dbname_ + "/db_copy"));
   ASSERT_OK(DB::Open(options, dbname_ + "/db_copy", &db_copy));
   ColumnFamilyHandle* copy_cfh = nullptr;
@@ -858,7 +857,7 @@ TEST_F(ImportColumnFamilyTest, ImportMultiColumnFamilyWithOverlap) {
   ASSERT_OK(db_copy->Flush(FlushOptions()));
 
   // Flush again to create another L0 file. It should have higher sequencer.
-  ASSERT_OK(Checkpoint::Create(db_copy, &checkpoint2));
+  ASSERT_OK(Checkpoint::Create(db_copy.get(), &checkpoint2));
   ASSERT_OK(checkpoint2->ExportColumnFamily(copy_cfh, export_files_dir2_,
                                             &metadata_ptr2_));
 
@@ -878,7 +877,7 @@ TEST_F(ImportColumnFamilyTest, ImportMultiColumnFamilyWithOverlap) {
 
   ASSERT_OK(db_copy->DropColumnFamily(copy_cfh));
   ASSERT_OK(db_copy->DestroyColumnFamilyHandle(copy_cfh));
-  delete db_copy;
+  db_copy.reset();
   ASSERT_OK(DestroyDir(env_, dbname_ + "/db_copy"));
 }
 
@@ -1018,7 +1017,7 @@ TEST_F(ImportColumnFamilyTest, AssignEpochNumberToMultipleCF) {
   // corruption where two L0 files can have the same epoch number but
   // with overlapping key range.
   Checkpoint* checkpoint1;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint1));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint1));
   ASSERT_OK(checkpoint1->ExportColumnFamily(handles_[1], export_files_dir_,
                                             &metadata_ptr_));
   ASSERT_OK(checkpoint1->ExportColumnFamily(handles_[2], export_files_dir2_,
@@ -1057,4 +1056,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-

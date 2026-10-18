@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "file/delete_scheduler.h"
 
 #include <cinttypes>
@@ -131,6 +130,7 @@ Status DeleteScheduler::AddFileToDeletionQueue(const std::string& file_path,
                  s.ToString().c_str());
 
   if (!s.ok()) {
+    IGNORE_STATUS_IF_ERROR(s);
     ROCKS_LOG_ERROR(info_log_, "Failed to mark %s as trash -- %s",
                     file_path.c_str(), s.ToString().c_str());
     s = fs_->DeleteFile(file_path, IOOptions(), nullptr);
@@ -152,6 +152,7 @@ Status DeleteScheduler::AddFileToDeletionQueue(const std::string& file_path,
     if (io_s.ok()) {
       total_trash_size_.fetch_add(trash_file_size);
     }
+    IGNORE_STATUS_IF_ERROR(s);
   }
   //**TODO: What should we do if we failed to
   // get the file size?
@@ -350,7 +351,7 @@ void DeleteScheduler::BackgroundEmptyTrash() {
           auto iter = pending_files_in_buckets_.find(bucket.value());
           assert(iter != pending_files_in_buckets_.end());
           if (iter != pending_files_in_buckets_.end()) {
-            pending_files_in_bucket = iter->second--;
+            pending_files_in_bucket = --iter->second;
           }
         }
       }
@@ -510,4 +511,3 @@ void DeleteScheduler::MaybeCreateBackgroundThread() {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-

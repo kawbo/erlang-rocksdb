@@ -1,5 +1,6 @@
-set(ROCKSDB_ROOT_DIR "${PROJECT_SOURCE_DIR}/../deps/rocksdb")
-
+# Get absolute path to rocksdb sources (PROJECT_SOURCE_DIR is c_src)
+get_filename_component(ROCKSDB_ROOT_DIR "${PROJECT_SOURCE_DIR}/../deps/rocksdb" ABSOLUTE)
+message(STATUS "RocksDB source directory: ${ROCKSDB_ROOT_DIR}")
 
 set(rocksdb_CMAKE_ARGS -DCMAKE_POSITION_INDEPENDENT_CODE=ON)
 
@@ -22,6 +23,7 @@ list(APPEND rocksdb_CMAKE_ARGS -DWITH_TESTS=OFF)
 
 list(APPEND rocksdb_CMAKE_ARGS -DWITH_GFLAGS=OFF)
 list(APPEND rocksdb_CMAKE_ARGS -DWITH_JEMALLOC=OFF)
+list(APPEND rocksdb_CMAKE_ARGS -DWITH_LIBURING=OFF)
 list(APPEND rocksdb_CMAKE_ARGS -DWITH_TBB=${TBB_FOUND})
 
 list(APPEND rocksdb_CMAKE_ARGS -DWITH_SNAPPY=${SNAPPY_FOUND})
@@ -29,6 +31,13 @@ list(APPEND rocksdb_CMAKE_ARGS -DWITH_LZ4=${LZ4_FOUND})
 list(APPEND rocksdb_CMAKE_ARGS -DWITH_ZLIB=${ZLIB_FOUND})
 list(APPEND rocksdb_CMAKE_ARGS -DWITH_BZ2=${BZIP2_FOUND})
 list(APPEND rocksdb_CMAKE_ARGS -DWITH_ZSTD=${ZSTD_FOUND})
+
+# FreeBSD: ensure system include path is available for malloc_np.h
+if(CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
+    set(FREEBSD_INCLUDE_FLAGS "-I/usr/include -I/usr/local/include")
+    list(APPEND rocksdb_CMAKE_ARGS "-DCMAKE_CXX_FLAGS=${FREEBSD_INCLUDE_FLAGS}")
+    list(APPEND rocksdb_CMAKE_ARGS "-DCMAKE_C_FLAGS=${FREEBSD_INCLUDE_FLAGS}")
+endif()
 
 if(MSVC)
     list(APPEND rocksdb_CMAKE_ARGS -DWITHOUT_THIRDPARTY_INC=ON)
@@ -42,6 +51,10 @@ if(WITH_BUNDLE_LZ4)
     list(APPEND rocksdb_CMAKE_ARGS -Dlz4_ROOT_DIR=${LZ4_ROOT_DIR})
 endif()
 
+if(ZSTD_BUNDLED)
+    list(APPEND rocksdb_CMAKE_ARGS -Dzstd_ROOT_DIR=${ZSTD_ROOT_DIR})
+endif()
+
 message(STATUS "cmake args ${rocksdb_CMAKE_ARGS}")
 
 include(ExternalProject)
@@ -53,6 +66,7 @@ endif()
 
 ExternalProject_Add(rocksdb
     SOURCE_DIR "${ROCKSDB_ROOT_DIR}"
+    BUILD_ALWAYS ON
     DOWNLOAD_COMMAND ""
     CMAKE_ARGS ${rocksdb_CMAKE_ARGS}
     BUILD_COMMAND ${BUILD_CMD}
@@ -64,11 +78,15 @@ ExternalProject_Get_Property(rocksdb BINARY_DIR)
 add_dependencies(${ErlangRocksDBNIF_TARGET} rocksdb)
 
 if(WITH_BUNDLE_SNAPPY)
-    ExternalProject_Add_StepDependencies(rocksdb build snappy)
+    ExternalProject_Add_StepDependencies(rocksdb configure snappy)
 endif()
 
 if(WITH_BUNDLE_LZ4)
-    ExternalProject_Add_StepDependencies(rocksdb build lz4)
+    ExternalProject_Add_StepDependencies(rocksdb configure lz4)
+endif()
+
+if(ZSTD_BUNDLED)
+    ExternalProject_Add_StepDependencies(rocksdb configure zstd)
 endif()
 
 if(MSVC)

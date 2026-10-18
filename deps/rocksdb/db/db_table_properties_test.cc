@@ -25,7 +25,6 @@
 #include "util/atomic.h"
 #include "util/random.h"
 
-
 namespace ROCKSDB_NAMESPACE {
 
 // A helper function that ensures the table properties returned in
@@ -70,14 +69,6 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTest) {
 
   // Create 4 tables
   for (int table = 0; table < 4; ++table) {
-    // Use old meta name for table properties for one file
-    if (table == 3) {
-      SyncPoint::GetInstance()->SetCallBack(
-          "BlockBasedTableBuilder::WritePropertiesBlock:Meta", [&](void* meta) {
-            *static_cast<const std::string**>(meta) = &kPropertiesBlockOldName;
-          });
-      SyncPoint::GetInstance()->EnableProcessing();
-    }
     // Build file
     for (int i = 0; i < 10 + table; ++i) {
       ASSERT_OK(
@@ -85,7 +76,6 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTest) {
     }
     ASSERT_OK(db_->Flush(FlushOptions()));
   }
-  SyncPoint::GetInstance()->DisableProcessing();
   std::string original_session_id;
   ASSERT_OK(db_->GetDbSessionId(original_session_id));
 
@@ -100,7 +90,7 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTest) {
   // Clear out auto-opened files
   dbfull()->TEST_table_cache()->EraseUnRefEntries();
   ASSERT_EQ(dbfull()->TEST_table_cache()->GetUsage(), 0U);
-  VerifyTableProperties(db_, 10 + 11 + 12 + 13);
+  VerifyTableProperties(db_.get(), 10 + 11 + 12 + 13);
 
   // 2. Put two tables to table cache and
   Reopen(options);
@@ -113,7 +103,7 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTest) {
     Get(std::to_string(i * 100 + 0));
   }
 
-  VerifyTableProperties(db_, 10 + 11 + 12 + 13);
+  VerifyTableProperties(db_.get(), 10 + 11 + 12 + 13);
 
   // 3. Put all tables to table cache
   Reopen(options);
@@ -121,7 +111,7 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTest) {
   for (int i = 0; i < 4; ++i) {
     Get(std::to_string(i * 100 + 0));
   }
-  VerifyTableProperties(db_, 10 + 11 + 12 + 13);
+  VerifyTableProperties(db_.get(), 10 + 11 + 12 + 13);
 
   // 4. Try to read CORRUPT properties (a) directly from file, and (b)
   // through reader on Get
@@ -170,10 +160,7 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTest) {
   SyncPoint::GetInstance()->DisableProcessing();
 }
 
-TEST_F(DBTablePropertiesTest, InvalidIgnored) {
-  // RocksDB versions 2.5 - 2.7 generate some properties that Block considers
-  // invalid in some way. This approximates that.
-
+TEST_F(DBTablePropertiesTest, InvalidReportedAsCorruption) {
   // Inject properties block data that Block considers invalid
   SyncPoint::GetInstance()->SetCallBack(
       "BlockBasedTableBuilder::WritePropertiesBlock:BlockData",
@@ -190,13 +177,10 @@ TEST_F(DBTablePropertiesTest, InvalidIgnored) {
   for (int i = 0; i < 10; ++i) {
     ASSERT_OK(db_->Put(WriteOptions(), std::to_string(i), "val"));
   }
-  ASSERT_OK(db_->Flush(FlushOptions()));
+  // Corrupted properties block should be detected and reported as corruption
+  ASSERT_TRUE(db_->Flush(FlushOptions()).IsCorruption());
 
   SyncPoint::GetInstance()->DisableProcessing();
-
-  // Not crashing is good enough
-  TablePropertiesCollection props;
-  ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
 }
 
 TEST_F(DBTablePropertiesTest, CreateOnDeletionCollectorFactory) {
@@ -228,6 +212,56 @@ TEST_F(DBTablePropertiesTest, CreateOnDeletionCollectorFactory) {
   ASSERT_EQ(100U, del_factory->GetWindowSize());
   ASSERT_EQ(90U, del_factory->GetDeletionTrigger());
   ASSERT_EQ(0.5, del_factory->GetDeletionRatio());
+}
+
+TEST_F(DBTablePropertiesTest, GetPropertiesOfTablesByLevelTest) {
+  Random rnd(202);
+  Options options;
+  options.level_compaction_dynamic_level_bytes = false;
+  options.create_if_missing = true;
+  options.write_buffer_size = 4096;
+  options.max_write_buffer_number = 2;
+  options.level0_file_num_compaction_trigger = 2;
+  options.level0_slowdown_writes_trigger = 2;
+  options.level0_stop_writes_trigger = 2;
+  options.target_file_size_base = 2048;
+  options.max_bytes_for_level_base = 40960;
+  options.max_bytes_for_level_multiplier = 4;
+  options.hard_pending_compaction_bytes_limit = 16 * 1024;
+  options.num_levels = 8;
+  options.env = env_;
+
+  DestroyAndReopen(options);
+
+  // build a decent LSM
+  for (int i = 0; i < 10000; i++) {
+    EXPECT_OK(Put(test::RandomKey(&rnd, 5), rnd.RandomString(102)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  if (NumTableFilesAtLevel(0) == 0) {
+    EXPECT_OK(Put(test::RandomKey(&rnd, 5), rnd.RandomString(102)));
+    ASSERT_OK(Flush());
+  }
+
+  ASSERT_OK(db_->PauseBackgroundWork());
+
+  // Ensure that we have at least L0, L1 and L2
+  ASSERT_GT(NumTableFilesAtLevel(0), 0);
+  ASSERT_GT(NumTableFilesAtLevel(1), 0);
+  ASSERT_GT(NumTableFilesAtLevel(2), 0);
+  ColumnFamilyMetaData cf_meta;
+  db_->GetColumnFamilyMetaData(&cf_meta);
+  std::vector<std::unique_ptr<TablePropertiesCollection>> levels_props;
+  ASSERT_OK(db_->GetPropertiesOfTablesByLevel(db_->DefaultColumnFamily(),
+                                              &levels_props));
+  for (int i = 0; i < 8; i++) {
+    const std::unique_ptr<TablePropertiesCollection>& level_props =
+        levels_props[i];
+    ASSERT_EQ(level_props->size(), cf_meta.levels[i].files.size());
+  }
+
+  Close();
 }
 
 // Test params:
@@ -293,7 +327,7 @@ class DBTablePropertiesInRangeTest : public DBTestBase,
     keys.reserve(range_size * 2);
     for (auto& r : ranges) {
       auto [start, limit] = MaybeAddTimestampsToRange(
-          &r.start, &r.limit, ts_sz, &keys.emplace_back(), &keys.emplace_back(),
+          r.start, r.limit, ts_sz, &keys.emplace_back(), &keys.emplace_back(),
           /*exclusive_end=*/false);
       EXPECT_TRUE(start.has_value());
       EXPECT_TRUE(limit.has_value());
@@ -738,12 +772,51 @@ TEST_P(DBTablePropertiesTest, RatioBasedDeletionTriggeredCompactionMarking) {
   }
 }
 
+TEST_F(DBTablePropertiesTest, KeyLargestSmallestSeqno) {
+  ASSERT_OK(db_->Put(WriteOptions(), "key1", "value1"));
+  ASSERT_OK(db_->Put(WriteOptions(), "key2", "value2"));
+  ASSERT_OK(db_->Put(WriteOptions(), "key3", "value3"));
+  ASSERT_OK(db_->Flush(FlushOptions()));
+
+  {
+    TablePropertiesCollection props;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+    ASSERT_EQ(1U, props.size());
+
+    auto table_props = props.begin()->second;
+
+    ASSERT_TRUE(table_props->HasKeyLargestSeqno());
+    ASSERT_TRUE(table_props->HasKeySmallestSeqno());
+
+    ASSERT_EQ(table_props->key_largest_seqno,
+              table_props->key_smallest_seqno + 2);
+    ASSERT_GT(table_props->key_largest_seqno, 0U);
+    ASSERT_GT(table_props->key_smallest_seqno, 0U);
+  }
+
+  // Becomes zero after compaction
+  {
+    CompactRangeOptions cro;
+    cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+    TablePropertiesCollection props;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+    ASSERT_EQ(1U, props.size());
+
+    auto table_props = props.begin()->second;
+    ASSERT_TRUE(table_props->HasKeyLargestSeqno());
+    ASSERT_TRUE(table_props->HasKeySmallestSeqno());
+
+    ASSERT_EQ(table_props->key_largest_seqno, table_props->key_smallest_seqno);
+    ASSERT_EQ(table_props->key_largest_seqno, 0U);
+  }
+}
+
 INSTANTIATE_TEST_CASE_P(DBTablePropertiesTest, DBTablePropertiesTest,
                         ::testing::Values("kCompactionStyleLevel",
                                           "kCompactionStyleUniversal"));
 
 }  // namespace ROCKSDB_NAMESPACE
-
 
 int main(int argc, char** argv) {
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();

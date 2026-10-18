@@ -126,6 +126,8 @@ Status FilePrefetchBuffer::Read(BufferInfo* buf, const IOOptions& opts,
 
   if (usage_ == FilePrefetchBufferUsage::kUserScanPrefetch) {
     RecordTick(stats_, PREFETCH_BYTES, read_len);
+  } else if (usage_ == FilePrefetchBufferUsage::kCompactionPrefetch) {
+    RecordInHistogram(stats_, COMPACTION_PREFETCH_BYTES, read_len);
   }
   if (!use_fs_buffer) {
     // Update the buffer size.
@@ -154,8 +156,22 @@ Status FilePrefetchBuffer::ReadAsync(BufferInfo* buf, const IOOptions& opts,
                                &(buf->del_fn_), /*aligned_buf =*/nullptr);
   req.status.PermitUncheckedError();
   if (s.ok()) {
-    RecordTick(stats_, PREFETCH_BYTES, read_len);
+    if (usage_ == FilePrefetchBufferUsage::kUserScanPrefetch) {
+      RecordTick(stats_, PREFETCH_BYTES, read_len);
+    }
     buf->async_read_in_progress_ = true;
+  } else if (s.IsNotSupported()) {
+    // Async IO is not available (e.g., io_uring failed to initialize).
+    // Fall back to synchronous read so the buffer is populated inline
+    // and callers proceed transparently.
+    s = reader->Read(opts, start_offset, read_len, &result,
+                     buf->buffer_.BufferStart(), /*aligned_buf=*/nullptr);
+    if (s.ok()) {
+      buf->buffer_.Size(buf->CurrentSize() + result.size());
+      if (usage_ == FilePrefetchBufferUsage::kUserScanPrefetch) {
+        RecordTick(stats_, PREFETCH_BYTES, read_len);
+      }
+    }
   }
   return s;
 }
@@ -347,7 +363,7 @@ void FilePrefetchBuffer::ClearOutdatedData(uint64_t offset, size_t length) {
   assert(IsBufferQueueEmpty() || buf->IsOffsetInBuffer(offset));
 }
 
-void FilePrefetchBuffer::PollIfNeeded(uint64_t offset, size_t length) {
+Status FilePrefetchBuffer::PollIfNeeded(uint64_t offset, size_t length) {
   BufferInfo* buf = GetFirstBuffer();
 
   if (buf->async_read_in_progress_ && fs_ != nullptr) {
@@ -358,7 +374,16 @@ void FilePrefetchBuffer::PollIfNeeded(uint64_t offset, size_t length) {
       std::vector<void*> handles;
       handles.emplace_back(buf->io_handle_);
       StopWatch sw(clock_, stats_, POLL_WAIT_MICROS);
-      fs_->Poll(handles, 1).PermitUncheckedError();
+      IOStatus io_s = fs_->Poll(handles, 1);
+      // Allow tests to inject Poll errors
+      TEST_SYNC_POINT_CALLBACK("FilePrefetchBuffer::PollIfNeeded:IOStatus",
+                               &io_s);
+      if (!io_s.ok()) {
+        // On Poll failure, clean up the handle and abort.
+        // DestroyAndClearIOHandle also sets async_read_in_progress_ to false.
+        DestroyAndClearIOHandle(buf);
+        return io_s;
+      }
     }
 
     // Reset and Release io_handle after the Poll API as request has been
@@ -369,6 +394,7 @@ void FilePrefetchBuffer::PollIfNeeded(uint64_t offset, size_t length) {
   // Always call outdated data after Poll as Buffers might be out of sync w.r.t
   // offset and length.
   ClearOutdatedData(offset, length);
+  return Status::OK();
 }
 
 // ReadAheadSizeTuning API calls readaheadsize_cb_
@@ -507,7 +533,10 @@ Status FilePrefetchBuffer::HandleOverlappingAsyncData(
   // by Seek, but the next access is at another offset.
   if (buf->async_read_in_progress_ &&
       buf->IsOffsetInBufferWithAsyncProgress(offset)) {
-    PollIfNeeded(offset, length);
+    Status poll_status = PollIfNeeded(offset, length);
+    if (!poll_status.ok()) {
+      return poll_status;
+    }
   }
 
   if (IsBufferQueueEmpty() || NumBuffersAllocated() == 1) {
@@ -642,7 +671,10 @@ Status FilePrefetchBuffer::PrefetchInternal(const IOOptions& opts,
       return s;
     }
   } else {
-    PollIfNeeded(tmp_offset, tmp_length);
+    Status poll_status = PollIfNeeded(tmp_offset, tmp_length);
+    if (!poll_status.ok()) {
+      return poll_status;
+    }
   }
 
   AllocateBufferIfEmpty();
@@ -771,6 +803,12 @@ bool FilePrefetchBuffer::TryReadFromCache(const IOOptions& opts,
 bool FilePrefetchBuffer::TryReadFromCacheUntracked(
     const IOOptions& opts, RandomAccessFileReader* reader, uint64_t offset,
     size_t n, Slice* result, Status* status, bool for_compaction) {
+  // We disallow async IO for compaction reads since they are performed in
+  // the background anyways and are less latency sensitive compared to
+  // user-initiated reads
+  (void)for_compaction;
+  assert(!for_compaction || num_buffers_ == 1);
+
   if (track_min_offset_ && offset < min_offset_read_) {
     min_offset_read_ = static_cast<size_t>(offset);
   }
@@ -819,27 +857,22 @@ bool FilePrefetchBuffer::TryReadFromCacheUntracked(
       assert(reader != nullptr);
       assert(max_readahead_size_ >= readahead_size_);
 
-      if (for_compaction) {
-        s = Prefetch(opts, reader, offset, std::max(n, readahead_size_));
-      } else {
-        if (implicit_auto_readahead_) {
-          if (!IsEligibleForPrefetch(offset, n)) {
-            // Ignore status as Prefetch is not called.
-            s.PermitUncheckedError();
-            return false;
-          }
+      if (implicit_auto_readahead_) {
+        if (!IsEligibleForPrefetch(offset, n)) {
+          // Ignore status as Prefetch is not called.
+          s.PermitUncheckedError();
+          return false;
         }
-
-        // Prefetch n + readahead_size_/2 synchronously as remaining
-        // readahead_size_/2 will be prefetched asynchronously if num_buffers_
-        // > 1.
-        s = PrefetchInternal(
-            opts, reader, offset, n,
-            (num_buffers_ > 1 ? readahead_size_ / 2 : readahead_size_),
-            copy_to_overlap_buffer);
-        explicit_prefetch_submitted_ = false;
       }
 
+      // Prefetch n + readahead_size_/2 synchronously as remaining
+      // readahead_size_/2 will be prefetched asynchronously if num_buffers_
+      // > 1.
+      s = PrefetchInternal(
+          opts, reader, offset, n,
+          (num_buffers_ > 1 ? readahead_size_ / 2 : readahead_size_),
+          copy_to_overlap_buffer);
+      explicit_prefetch_submitted_ = false;
       if (!s.ok()) {
         if (status) {
           *status = s;
@@ -854,6 +887,7 @@ bool FilePrefetchBuffer::TryReadFromCacheUntracked(
       return false;
     }
   } else if (!for_compaction) {
+    // These stats are meant to track prefetch effectiveness for user reads only
     UpdateStats(/*found_in_buffer=*/true, n);
   }
 
@@ -863,9 +897,12 @@ bool FilePrefetchBuffer::TryReadFromCacheUntracked(
   if (copy_to_overlap_buffer) {
     buf = overlap_buf_;
   }
-  assert(buf->offset_ <= offset);
+  assert(buf->IsOffsetInBuffer(offset));
   uint64_t offset_in_buffer = offset - buf->offset_;
-  *result = Slice(buf->buffer_.BufferStart() + offset_in_buffer, n);
+  assert(offset_in_buffer < buf->CurrentSize());
+  *result = Slice(
+      buf->buffer_.BufferStart() + offset_in_buffer,
+      std::min(n, buf->CurrentSize() - static_cast<size_t>(offset_in_buffer)));
   if (prefetched) {
     readahead_size_ = std::min(max_readahead_size_, readahead_size_ * 2);
   }

@@ -325,6 +325,19 @@ public class Options extends RocksObject
   }
 
   @Override
+  public boolean openFilesAsync() {
+    assert (isOwningHandle());
+    return openFilesAsync(nativeHandle_);
+  }
+
+  @Override
+  public Options setOpenFilesAsync(final boolean openFilesAsync) {
+    assert (isOwningHandle());
+    setOpenFilesAsync(nativeHandle_, openFilesAsync);
+    return this;
+  }
+
+  @Override
   public int maxOpenFiles() {
     assert(isOwningHandle());
     return maxOpenFiles(nativeHandle_);
@@ -848,16 +861,16 @@ public class Options extends RocksObject
   }
 
   @Override
-  public Options setRandomAccessMaxBufferSize(final long randomAccessMaxBufferSize) {
-    assert(isOwningHandle());
-    setRandomAccessMaxBufferSize(nativeHandle_, randomAccessMaxBufferSize);
+  public Options setDailyOffpeakTimeUTC(String offpeakTimeUTC) {
+    assert (isOwningHandle());
+    setDailyOffpeakTimeUTC(nativeHandle_, offpeakTimeUTC);
     return this;
   }
 
   @Override
-  public long randomAccessMaxBufferSize() {
-    assert(isOwningHandle());
-    return randomAccessMaxBufferSize(nativeHandle_);
+  public String dailyOffpeakTimeUTC() {
+    assert (isOwningHandle());
+    return dailyOffpeakTimeUTC(nativeHandle_);
   }
 
   @Override
@@ -1043,19 +1056,6 @@ public class Options extends RocksObject
   public boolean skipStatsUpdateOnDbOpen() {
     assert(isOwningHandle());
     return skipStatsUpdateOnDbOpen(nativeHandle_);
-  }
-
-  @Override
-  public Options setSkipCheckingSstFileSizesOnDbOpen(
-      final boolean skipCheckingSstFileSizesOnDbOpen) {
-    setSkipCheckingSstFileSizesOnDbOpen(nativeHandle_, skipCheckingSstFileSizesOnDbOpen);
-    return this;
-  }
-
-  @Override
-  public boolean skipCheckingSstFileSizesOnDbOpen() {
-    assert (isOwningHandle());
-    return skipCheckingSstFileSizesOnDbOpen(nativeHandle_);
   }
 
   @Override
@@ -1763,19 +1763,6 @@ public class Options extends RocksObject
   }
 
   @Override
-  public Options setMaxWriteBufferNumberToMaintain(
-      final int maxWriteBufferNumberToMaintain) {
-    setMaxWriteBufferNumberToMaintain(
-        nativeHandle_, maxWriteBufferNumberToMaintain);
-    return this;
-  }
-
-  @Override
-  public int maxWriteBufferNumberToMaintain() {
-    return maxWriteBufferNumberToMaintain(nativeHandle_);
-  }
-
-  @Override
   public Options setCompactionPriority(
       final CompactionPriority compactionPriority) {
     setCompactionPriority(nativeHandle_, compactionPriority.getValue());
@@ -2163,6 +2150,8 @@ public class Options extends RocksObject
   private static native boolean errorIfExists(long handle);
   private static native void setParanoidChecks(long handle, boolean paranoidChecks);
   private static native boolean paranoidChecks(long handle);
+  private static native void setOpenFilesAsync(long handle, boolean openFilesAsync);
+  private static native boolean openFilesAsync(long handle);
   private static native void setRateLimiter(long handle, long rateLimiterHandle);
   private static native void setSstFileManager(final long handle, final long sstFileManagerHandle);
   private static native void setLogger(
@@ -2256,9 +2245,8 @@ public class Options extends RocksObject
   private static native void setCompactionReadaheadSize(
       final long handle, final long compactionReadaheadSize);
   private static native long compactionReadaheadSize(final long handle);
-  private static native void setRandomAccessMaxBufferSize(
-      final long handle, final long randomAccessMaxBufferSize);
-  private static native long randomAccessMaxBufferSize(final long handle);
+  private static native void setDailyOffpeakTimeUTC(final long handle, final String offpeakTimeUTC);
+  private static native String dailyOffpeakTimeUTC(final long handle);
   private static native void setWritableFileMaxBufferSize(
       final long handle, final long writableFileMaxBufferSize);
   private static native long writableFileMaxBufferSize(final long handle);
@@ -2297,9 +2285,6 @@ public class Options extends RocksObject
   private static native void setSkipStatsUpdateOnDbOpen(
       final long handle, final boolean skipStatsUpdateOnDbOpen);
   private static native boolean skipStatsUpdateOnDbOpen(final long handle);
-  private static native void setSkipCheckingSstFileSizesOnDbOpen(
-      final long handle, final boolean skipChecking);
-  private static native boolean skipCheckingSstFileSizesOnDbOpen(final long handle);
   private static native void setWalRecoveryMode(final long handle, final byte walRecoveryMode);
   private static native byte walRecoveryMode(final long handle);
   private static native void setAllow2pc(final long handle, final boolean allow2pc);
@@ -2444,9 +2429,6 @@ public class Options extends RocksObject
   private static native int[] maxBytesForLevelMultiplierAdditional(long handle);
   private static native void setParanoidFileChecks(long handle, boolean paranoidFileChecks);
   private static native boolean paranoidFileChecks(long handle);
-  private static native void setMaxWriteBufferNumberToMaintain(
-      final long handle, final int maxWriteBufferNumberToMaintain);
-  private static native int maxWriteBufferNumberToMaintain(final long handle);
   private static native void setCompactionPriority(
       final long handle, final byte compactionPriority);
   private static native byte compactionPriority(final long handle);

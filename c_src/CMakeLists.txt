@@ -28,6 +28,28 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/CMake")
 
+# Add standard package manager paths for macOS (MacPorts and Homebrew)
+if(APPLE)
+    # MacPorts
+    if(EXISTS "/opt/local")
+        list(APPEND CMAKE_PREFIX_PATH "/opt/local")
+        list(APPEND CMAKE_INCLUDE_PATH "/opt/local/include")
+        list(APPEND CMAKE_LIBRARY_PATH "/opt/local/lib")
+    endif()
+    # Homebrew on Apple Silicon
+    if(EXISTS "/opt/homebrew")
+        list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew")
+        list(APPEND CMAKE_INCLUDE_PATH "/opt/homebrew/include")
+        list(APPEND CMAKE_LIBRARY_PATH "/opt/homebrew/lib")
+    endif()
+    # Homebrew on Intel (default location)
+    if(EXISTS "/usr/local/include")
+        list(APPEND CMAKE_PREFIX_PATH "/usr/local")
+        list(APPEND CMAKE_INCLUDE_PATH "/usr/local/include")
+        list(APPEND CMAKE_LIBRARY_PATH "/usr/local/lib")
+    endif()
+endif()
+
 # includes
 # set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake" ${CMAKE_MODULE_PATH})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
@@ -48,6 +70,13 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Check for C++20 support (required by RocksDB 10.x)
+include(CheckCXXCompilerFlag)
+CHECK_CXX_COMPILER_FLAG("-std=c++20" COMPILER_SUPPORTS_CXX20)
+if(NOT COMPILER_SUPPORTS_CXX20)
+    message(FATAL_ERROR "The compiler ${CMAKE_CXX_COMPILER} does not support C++20. "
+                        "RocksDB 10.x requires C++20. Please use GCC >= 11 or Clang >= 10.")
+endif()
 
 if (NOT WIN32)
   # On platforms like FreeBSD where gmake is not the default, we need
@@ -76,6 +105,11 @@ endif()
 set(CMAKE_BUILD_TYPE Release)
 
 set(CMAKE_THREAD_PREFER_PTHREAD ON)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
+# OpenSSL provides the AES-256 block transform used by the encrypted env.
+find_package(OpenSSL REQUIRED)
 
 option(WITH_CCACHE "Build with ccache." OFF)
 if(WITH_CCACHE)
@@ -89,10 +123,30 @@ if(WITH_CCACHE)
   endif(CCACHE_FOUND)
 endif(WITH_CCACHE)
 
-option(WITH_ZSTD "build with zstd" OFF)
-option(WITH_SNAPPY "build with SNAPPY" OFF)
-option(WITH_LZ4 "build with lz4" OFF)
+# Compression library options
+# LZ4 and Snappy: auto-detect system libs by default, unless WITH_BUNDLE_* is set
+# Zstd: bundled by default; WITH_SYSTEM_ZSTD looks for the system lib first, falling back to bundled
+option(WITH_BUNDLE_LZ4 "Use bundled lz4 instead of system" OFF)
+option(WITH_BUNDLE_SNAPPY "Use bundled snappy instead of system" OFF)
+option(WITH_SYSTEM_ZSTD "Use system zstd if found" OFF)
+option(WITH_BUNDLE_ZSTD "Fallback to bundled zstd if system not found" ON)
+option(WITH_ZSTD "build with zstd" ON)
 option(WITH_ZLIB "build with zlib" OFF)
+option(WITH_BZ2 "build with bzip2" OFF)
+
+# LZ4: use bundled if requested, otherwise auto-detect
+if(WITH_BUNDLE_LZ4)
+    set(WITH_LZ4 OFF)
+else()
+    option(WITH_LZ4 "build with lz4" ON)
+endif()
+
+# Snappy: use bundled if requested, otherwise auto-detect
+if(WITH_BUNDLE_SNAPPY)
+    set(WITH_SNAPPY OFF)
+else()
+    option(WITH_SNAPPY "build with SNAPPY" ON)
+endif()
 
 if(WITH_ZLIB)
     find_package(zlib REQUIRED)
@@ -107,39 +161,77 @@ if(WITH_ZLIB)
     list(APPEND THIRDPARTY_LIBS ${ZLIB_LIBRARIES})
 endif()
 
-option(WITH_BZ2 "build with bzip2" OFF)
 if(WITH_BZ2)
     find_package(BZip2 REQUIRED)
 endif()
 
-
-option(WITH_BUNDLE_LZ4 "Use bundle lz4" OFF)
-if (WITH_BUNDLE_LZ4 AND NOT WITH_LZ4)
+# LZ4: use bundled or find system library
+if(WITH_BUNDLE_LZ4)
     include(build-lz4)
+elseif(WITH_LZ4)
+    find_package(LZ4)
+    if(NOT LZ4_FOUND)
+        message(STATUS "LZ4 not found, disabling LZ4 support")
+        set(WITH_LZ4 OFF)
+    endif()
 endif()
 
-if(WITH_LZ4)
-    find_package(LZ4 REQUIRED)
-endif()
-
-option(WITH_BUNDLE_SNAPPY "Use bundle snappy" OFF)
-
-if(WITH_BUNDLE_SNAPPY AND NOT WITH_SNAPPY)
+# Snappy: use bundled or find system library
+if(WITH_BUNDLE_SNAPPY)
     include(build-snappy)
+elseif(WITH_SNAPPY)
+    find_package(Snappy)
+    if(NOT SNAPPY_FOUND AND NOT Snappy_FOUND)
+        message(STATUS "Snappy not found, disabling Snappy support")
+        set(WITH_SNAPPY OFF)
+    endif()
 endif()
 
-if(WITH_SNAPPY)
-    find_package(Snappy REQUIRED)
-endif()
-
+# Zstd: try system library first if requested, fallback to bundled if not found
 if(WITH_ZSTD)
-  find_package(Zstd REQUIRED)
+    if(WITH_SYSTEM_ZSTD)
+        find_package(Zstd)
+    endif()
+    if(NOT ZSTD_FOUND AND NOT Zstd_FOUND)
+        if(WITH_BUNDLE_ZSTD)
+            message(STATUS "Using bundled Zstd")
+            include(build-zstd)
+        else()
+            message(STATUS "Zstd not found and bundled disabled, disabling Zstd support")
+            set(WITH_ZSTD OFF)
+        endif()
+    endif()
 endif()
+
+# A failed find_path leaves <PKG>_INCLUDE_DIR set to "<PKG>_INCLUDE_DIR-NOTFOUND",
+# which CMake rejects as a relative include path at generate time. Only propagate
+# the paths that actually resolved. Both the system and the bundled paths set
+# <PKG>_FOUND, so it covers either case.
+set(COMPRESSION_INCLUDE_DIRS)
+set(COMPRESSION_LIBS)
+foreach(pkg ZSTD LZ4 SNAPPY)
+    if(${pkg}_FOUND)
+        list(APPEND COMPRESSION_INCLUDE_DIRS ${${pkg}_INCLUDE_DIR})
+    endif()
+endforeach()
+# snappy is linked separately below, see SNAPPY_LINK_LIBS
+foreach(pkg ZSTD LZ4)
+    if(${pkg}_FOUND)
+        list(APPEND COMPRESSION_LIBS ${${pkg}_LIBRARY})
+    endif()
+endforeach()
 
 
 option(WITH_TBB "build with Threading Building Blocks (TBB)" OFF)
 if(WITH_TBB)
   find_package(TBB REQUIRED)
+endif()
+
+# CRoaring for posting list bitmap operations
+option(WITH_CROARING "build with CRoaring for posting list bitmaps" ON)
+if(WITH_CROARING)
+    include(build-croaring)
+    add_definitions(-DWITH_CROARING)
 endif()
 
 # Use RocksDB provided by host system
@@ -164,12 +256,15 @@ include_directories(${ERLANG_EI_INCLUDE_PATH})
 include_directories(${ERLANG_ERTS_INCLUDE_PATH})
 #--------------------------------------------------------------------------------
 
-include_directories(${ZSTD_INCLUDE_DIR})
-include_directories(${LZ4_INCLUDE_DIR})
+if(COMPRESSION_INCLUDE_DIRS)
+    include_directories(${COMPRESSION_INCLUDE_DIRS})
+endif()
 include_directories(${BZIP2_INCLUDE_DIR})
 include_directories(${ZLIB_INCLUDE_DIR})
-include_directories(${SNAPPY_INCLUDE_DIR})
 include_directories(${ROCKSDB_INCLUDE_DIRS})
+if(WITH_CROARING)
+    include_directories(${CROARING_INCLUDE_DIR})
+endif()
 #include_directories(${LIBGFLAGS_INCLUDE_DIR})
 
 #--------------------------------------------------------------------------------
@@ -187,7 +282,7 @@ else()
   if(MINGW)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-format")
   endif()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++20")
   if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer")
     include(CheckCXXCompilerFlag)
@@ -205,12 +300,17 @@ target_sources(${ErlangRocksDBNIF_TARGET}
     ${CMAKE_CURRENT_SOURCE_DIR}/backup.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/batch.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/transaction.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/pessimistic_transaction.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/bitset_merge_operator.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/cache.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/statistics.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/counter_merge_operator.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/aes_block_cipher.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/env.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/erlang_merge.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/compaction_filter.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/posting_list_merge_operator.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/posting_list_nif.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/erocksdb_column_family.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/erocksdb_db.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/erocksdb_iter.cc
@@ -218,6 +318,8 @@ target_sources(${ErlangRocksDBNIF_TARGET}
     ${CMAKE_CURRENT_SOURCE_DIR}/rate_limiter.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/refobjects.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/sst_file_manager.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/sst_file_writer.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/sst_file_reader.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/transaction_log.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/util.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/write_buffer_manager.cc
@@ -227,9 +329,8 @@ target_include_directories(${ErlangRocksDBNIF_TARGET}
     PRIVATE
     ${DEFAULT_INCLUDE_DIRECTORIES}
     ${ROCKSDB_INCLUDE_DIR}
-    ${ZSTD_INCLUDE_DIR}
-    ${LZ4_INCLUDE_DIR}
-    ${SNAPPY_INCLUDE_DIR}
+    ${COMPRESSION_INCLUDE_DIRS}
+    ${OPENSSL_INCLUDE_DIR}
     ${PROJECT_BINARY_DIR}
 )
 
@@ -245,18 +346,50 @@ if(APPLE)
 	set(TARGET_LINKER_OPTIONS "-flat_namespace -undefined suppress")
 endif(APPLE)
 
+# On Linux with bundled snappy, we need --whole-archive to include all symbols
+# including RTTI symbols that are needed at runtime but not directly referenced
+if(NOT SNAPPY_FOUND)
+    set(SNAPPY_LINK_LIBS "")
+elseif(WITH_BUNDLE_SNAPPY AND NOT APPLE AND NOT MSVC)
+    # Handle snappy separately with whole-archive wrapper
+    set(SNAPPY_LINK_LIBS "")
+else()
+    set(SNAPPY_LINK_LIBS ${SNAPPY_LIBRARY})
+endif()
+
 target_link_libraries(
     ${ErlangRocksDBNIF_TARGET}
     PRIVATE
     ${TARGET_LINKER_OPTIONS}
     ${ROCKSDB_LIBRARIES}
-    ${ZSTD_LIBRARY}
-    ${LZ4_LIBRARY}
-    ${SNAPPY_LIBRARY}
+    ${COMPRESSION_LIBS}
+    ${SNAPPY_LINK_LIBS}
     ${BZIP2_LIBRARIES}
     ${ZLIB_LIBRARY}
     ${TBB_LIBRARIES}
+    OpenSSL::Crypto
+    Threads::Threads
 )
+
+# Link CRoaring library
+if(WITH_CROARING)
+    target_link_libraries(
+        ${ErlangRocksDBNIF_TARGET}
+        PRIVATE
+        ${CROARING_LIBRARY}
+    )
+endif()
+
+# Link bundled snappy with --whole-archive to include RTTI symbols
+if(WITH_BUNDLE_SNAPPY AND NOT APPLE AND NOT MSVC)
+    target_link_libraries(
+        ${ErlangRocksDBNIF_TARGET}
+        PRIVATE
+        "-Wl,--whole-archive"
+        "${SNAPPY_LIBRARY}"
+        "-Wl,--no-whole-archive"
+    )
+endif()
 
 if(MSVC)
 	target_link_libraries(

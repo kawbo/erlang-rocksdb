@@ -3,7 +3,7 @@
 // eleveldb: Erlang Wrapper for LevelDB (http://code.google.com/p/leveldb/)
 //
 // Copyright (c) 2011-2013 Basho Technologies, Inc. All Rights Reserved.
-// Copyright (c) 2016-2022 Benoit Chesneau/
+// Copyright (c) 2016-2026 Benoit Chesneau/
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -192,14 +192,14 @@ DbObject::CreateDbObjectType(
 
 
 DbObject *
-DbObject::CreateDbObject(rocksdb::DB * Db)
+DbObject::CreateDbObject(rocksdb::DB * Db, bool IsPessimistic, bool IsTTL)
 {
     DbObject * ret_ptr;
     void * alloc_ptr;
 
     // the alloc call initializes the reference count to "one"
     alloc_ptr=enif_alloc_resource(m_Db_RESOURCE, sizeof(DbObject));
-    ret_ptr=new (alloc_ptr) DbObject(Db);
+    ret_ptr=new (alloc_ptr) DbObject(Db, IsPessimistic, IsTTL);
 
     // manual reference increase to keep active until "close" called
     //  only inc local counter, leave erl ref count alone ... will force
@@ -256,8 +256,8 @@ DbObject::DbObjectResourceCleanup(
 }   // DbObject::DbObjectResourceCleanup
 
 
-DbObject::DbObject(rocksdb::DB * DbPtr)
-    : m_Db(DbPtr)
+DbObject::DbObject(rocksdb::DB * DbPtr, bool IsPessimistic, bool IsTTL)
+    : m_Db(DbPtr), m_IsPessimistic(IsPessimistic), m_IsTTL(IsTTL)
     {}   // DbObject::DbObject
 
 
@@ -859,6 +859,15 @@ ItrObject::SetLowerBoundSlice(rocksdb::Slice *slice) {
 }
 
 
+void
+ItrObject::KeepResource(void *Resource) {
+    if (nullptr != Resource) {
+        enif_keep_resource(Resource);
+        m_KeptResources.push_back(Resource);
+    }
+}
+
+
 
 ItrObject::ItrObject(
         DbObject *DbPtr,
@@ -895,6 +904,13 @@ ItrObject::~ItrObject() {
 
     delete m_Iterator;
     //m_Iterator = nullptr;
+
+    // release any resources (column family, transaction) pinned for this
+    // iterator's lifetime. Done after deleting the iterator, which still
+    // references them.
+    for (void *resource : m_KeptResources)
+        enif_release_resource(resource);
+    m_KeptResources.clear();
 
     return;
 

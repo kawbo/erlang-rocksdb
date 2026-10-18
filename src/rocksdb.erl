@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%
 %% Copyright (c) 2012-2015 Rakuten, Inc.
-%% Copyright (c) 2016-2020 Benoit Chesneau
+%% Copyright (c) 2016-2026 Benoit Chesneau
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -24,6 +24,10 @@
   open_readonly/2, open_readonly/3,
   open_optimistic_transaction_db/2, open_optimistic_transaction_db/3,
   open_with_ttl/4,
+  open_with_ttl_cf/4,
+  get_ttl/2,
+  set_ttl/2, set_ttl/3,
+  create_column_family_with_ttl/4,
   close/1,
   set_db_background_threads/2, set_db_background_threads/3,
   destroy/2,
@@ -36,15 +40,22 @@
   checkpoint/2,
   flush/2, flush/3,
   sync_wal/1,
+  flush_wal/2,
+  supported_compressions/0,
+  pause_background_work/1,
+  continue_background_work/1,
+  disable_manual_compaction/1,
+  enable_manual_compaction/1,
+  abort_all_compactions/1,
+  resume_all_compactions/1,
   stats/1, stats/2,
   get_property/2, get_property/3,
   get_approximate_sizes/3, get_approximate_sizes/4,
   get_approximate_memtable_stats/3, get_approximate_memtable_stats/4
 ]).
 
--export([open_with_cf/3, open_with_cf_readonly/3]).
--export([drop_column_family/1]).
--export([destroy_column_family/1]).
+-export([open_with_cf_readonly/3]).
+-export([get_column_family_metadata/1, get_column_family_metadata/2]).
 
 -export([get_latest_sequence_number/1]).
 
@@ -62,22 +73,21 @@
   delete/3, delete/4,
   single_delete/3, single_delete/4,
   get/3, get/4,
+  multi_get/3, multi_get/4,
+  put_entity/4, put_entity/5,
+  get_entity/3, get_entity/4,
   delete_range/4, delete_range/5,
   compact_range/4, compact_range/5,
   iterator/2, iterator/3,
   iterators/3,
+  coalescing_iterator/3,
   iterator_move/2,
   iterator_refresh/1,
-  iterator_close/1
+  iterator_prepare_value/1,
+  iterator_close/1,
+  iterator_columns/1,
+  delete_entity/3, delete_entity/4
 ]).
-
-%% deprecated API
-
--export([write/3]).
--export([count/1, count/2]).
--export([fold/4, fold/5, fold_keys/4, fold_keys/5]).
-
-
 
 %% Cache API
 -export([new_cache/2,
@@ -86,11 +96,6 @@
          cache_info/2,
          set_capacity/2,
          set_strict_capacity_limit/2]).
-
--export([new_lru_cache/1, new_clock_cache/1]).
--export([get_usage/1]).
--export([get_pinned_usage/1]).
--export([get_capacity/1]).
 
 %% Limiter API
 -export([
@@ -103,7 +108,39 @@
   new_sst_file_manager/1, new_sst_file_manager/2,
   release_sst_file_manager/1,
   sst_file_manager_flag/3,
-  sst_file_manager_info/1, sst_file_manager_info/2
+  sst_file_manager_info/1, sst_file_manager_info/2,
+  sst_file_manager_tracked_files/1
+]).
+
+%% sst file writer API
+-export([
+  sst_file_writer_open/2,
+  sst_file_writer_put/3,
+  sst_file_writer_put_entity/3,
+  sst_file_writer_merge/3,
+  sst_file_writer_delete/2,
+  sst_file_writer_delete_range/3,
+  sst_file_writer_finish/1, sst_file_writer_finish/2,
+  sst_file_writer_file_size/1,
+  release_sst_file_writer/1
+]).
+
+%% ingest external file API
+-export([
+  ingest_external_file/3,
+  ingest_external_file/4
+]).
+
+%% sst file reader API
+-export([
+  sst_file_reader_open/2,
+  sst_file_reader_iterator/2,
+  sst_file_reader_get_table_properties/1,
+  sst_file_reader_verify_checksum/1,
+  sst_file_reader_verify_checksum/2,
+  sst_file_reader_iterator_move/2,
+  sst_file_reader_iterator_close/1,
+  release_sst_file_reader/1
 ]).
 
 %% write buffer manager API
@@ -119,6 +156,8 @@
   new_statistics/0,
   set_stats_level/2,
   statistics_info/1,
+  statistics_ticker/2,
+  statistics_histogram/2,
   release_statistics/1
 ]).
 
@@ -128,7 +167,6 @@
   set_env_background_threads/2, set_env_background_threads/3,
   destroy_env/1
 ]).
--export([default_env/0, mem_env/0]).
 
 %% Log Iterator API
 -export([tlog_iterator/2,
@@ -138,11 +176,6 @@
 
 -export([write_binary_update/3]).
 
--export([updates_iterator/2]).
--export([close_updates_iterator/1]).
--export([next_binary_update/1]).
--export([next_update/1]).
-
 %% Batch API
 -export([batch/0,
          release_batch/1,
@@ -151,6 +184,7 @@
          batch_merge/3, batch_merge/4,
          batch_delete/2, batch_delete/3,
          batch_single_delete/2, batch_single_delete/3,
+         batch_delete_range/3, batch_delete_range/4,
          batch_clear/1,
          batch_savepoint/1,
          batch_rollback/1,
@@ -158,18 +192,42 @@
          batch_data_size/1,
          batch_tolist/1]).
 
-%% Transaction API
+%% Transaction API (Optimistic)
 -export([
          transaction/2,
          release_transaction/1,
          transaction_put/3, transaction_put/4,
          transaction_get/3, transaction_get/4,
+         transaction_get_for_update/3, transaction_get_for_update/4,
+         transaction_multi_get/3, transaction_multi_get/4,
+         transaction_multi_get_for_update/3, transaction_multi_get_for_update/4,
          %% see comment in c_src/transaction.cc
          %% transaction_merge/3, transaction_merge/4,
          transaction_delete/2, transaction_delete/3,
          transaction_iterator/2, transaction_iterator/3,
          transaction_commit/1,
          transaction_rollback/1
+        ]).
+
+%% Pessimistic Transaction API
+-export([
+         open_pessimistic_transaction_db/2, open_pessimistic_transaction_db/3,
+         pessimistic_transaction/2, pessimistic_transaction/3,
+         release_pessimistic_transaction/1,
+         pessimistic_transaction_put/3, pessimistic_transaction_put/4,
+         pessimistic_transaction_get/3, pessimistic_transaction_get/4,
+         pessimistic_transaction_get_for_update/3, pessimistic_transaction_get_for_update/4,
+         pessimistic_transaction_multi_get/3, pessimistic_transaction_multi_get/4,
+         pessimistic_transaction_multi_get_for_update/3, pessimistic_transaction_multi_get_for_update/4,
+         pessimistic_transaction_delete/2, pessimistic_transaction_delete/3,
+         pessimistic_transaction_iterator/2, pessimistic_transaction_iterator/3,
+         pessimistic_transaction_commit/1,
+         pessimistic_transaction_rollback/1,
+         pessimistic_transaction_set_savepoint/1,
+         pessimistic_transaction_rollback_to_savepoint/1,
+         pessimistic_transaction_pop_savepoint/1,
+         pessimistic_transaction_get_id/1,
+         pessimistic_transaction_get_waiting_txns/1
         ]).
 
 %% Backup Engine
@@ -187,6 +245,40 @@
   restore_db_from_latest_backup/2, restore_db_from_latest_backup/3
 ]).
 
+%% Compaction Filter
+-export([compaction_filter_reply/2]).
+
+%% Posting List Helpers
+-export([
+  posting_list_decode/1,
+  posting_list_fold/3,
+  posting_list_keys/1,
+  posting_list_contains/2,
+  posting_list_find/2,
+  posting_list_count/1,
+  posting_list_to_map/1,
+  %% V2 format support
+  posting_list_version/1,
+  posting_list_intersection/2,
+  posting_list_union/2,
+  posting_list_difference/2,
+  posting_list_intersection_count/2,
+  posting_list_bitmap_contains/2,
+  posting_list_intersect_all/1,
+  %% Postings resource API (Lucene-style naming)
+  postings_open/1,
+  postings_contains/2,
+  postings_bitmap_contains/2,
+  postings_count/1,
+  postings_keys/1,
+  postings_intersection/2,
+  postings_union/2,
+  postings_difference/2,
+  postings_intersection_count/2,
+  postings_intersect_all/1,
+  postings_to_binary/1
+]).
+
 
 -export_type([
   env/0,
@@ -201,37 +293,23 @@
   rate_limiter_handle/0,
   compression_type/0,
   compaction_style/0,
-  access_hint/0,
   wal_recovery_mode/0,
   backup_engine/0,
   backup_info/0,
   sst_file_manager/0,
+  sst_file_writer/0,
+  sst_file_info/0,
+  sst_file_reader/0,
+  sst_file_reader_itr/0,
+  table_properties/0,
+  ingest_external_file_option/0,
   write_buffer_manager/0,
   statistics_handle/0,
-  stats_level/0
+  stats_level/0,
+  filter_rule/0,
+  filter_decision/0,
+  compaction_filter_opts/0
 ]).
-
--deprecated({count, 1, next_major_release}).
--deprecated({count, 2, next_major_release}).
--deprecated({fold, 4, next_major_release}).
--deprecated({fold, 5, next_major_release}).
--deprecated({fold_keys, 4, next_major_release}).
--deprecated({fold_keys, 5, next_major_release}).
--deprecated({write, 3, next_major_release}).
--deprecated({updates_iterator, 2, next_major_release}).
--deprecated({close_updates_iterator, 1, next_major_release}).
--deprecated({next_binary_update, 1, next_major_release}).
--deprecated({next_update, 1, next_major_release}).
--deprecated({default_env, 0, next_major_release}).
--deprecated({mem_env, 0, next_major_release}).
--deprecated({new_lru_cache, 1, next_major_release}).
--deprecated({new_clock_cache, 1, next_major_release}).
--deprecated({get_pinned_usage, 1, next_major_release}).
--deprecated({get_usage, 1, next_major_release}).
--deprecated({get_capacity, 1, next_major_release}).
--deprecated({drop_column_family, 1, next_major_release}).
--deprecated({destroy_column_family, 1, next_major_release}).
--deprecated({open_with_cf, 3, next_major_release}).
 
 -record(db_path, {path        :: file:filename_all(),
           target_size :: non_neg_integer()}).
@@ -241,7 +319,6 @@
 -type compression_type() :: snappy | zlib | bzip2 | lz4 | lz4h | zstd | none.
 -type compaction_style() :: level | universal | fifo | none.
 -type compaction_pri() :: compensated_size | oldest_largest_seq_first | oldest_smallest_seq_first.
--type access_hint() :: normal | sequential | willneed | none.
 -type wal_recovery_mode() :: tolerate_corrupted_tail_records |
                absolute_consistency |
                point_in_time_recovery |
@@ -251,6 +328,64 @@
 
 -opaque env_handle() :: reference() | binary().
 -opaque sst_file_manager() :: reference() | binary().
+-opaque sst_file_writer() :: reference() | binary().
+-type sst_file_info() :: #{
+    file_path := binary(),
+    smallest_key := binary(),
+    largest_key := binary(),
+    smallest_range_del_key := binary(),
+    largest_range_del_key := binary(),
+    file_size := non_neg_integer(),
+    num_entries := non_neg_integer(),
+    num_range_del_entries := non_neg_integer(),
+    sequence_number := non_neg_integer()
+}.
+-type ingest_external_file_option() ::
+    {move_files, boolean()} |
+    {failed_move_fall_back_to_copy, boolean()} |
+    {snapshot_consistency, boolean()} |
+    {allow_global_seqno, boolean()} |
+    {allow_blocking_flush, boolean()} |
+    {ingest_behind, boolean()} |
+    {verify_checksums_before_ingest, boolean()} |
+    {verify_checksums_readahead_size, non_neg_integer()} |
+    {verify_file_checksum, boolean()} |
+    {fail_if_not_bottommost_level, boolean()} |
+    {allow_db_generated_files, boolean()} |
+    {fill_cache, boolean()}.
+-opaque sst_file_reader() :: reference() | binary().
+-opaque sst_file_reader_itr() :: reference() | binary().
+-type table_properties() :: #{
+    data_size := non_neg_integer(),
+    index_size := non_neg_integer(),
+    index_partitions := non_neg_integer(),
+    top_level_index_size := non_neg_integer(),
+    filter_size := non_neg_integer(),
+    raw_key_size := non_neg_integer(),
+    raw_value_size := non_neg_integer(),
+    num_data_blocks := non_neg_integer(),
+    num_entries := non_neg_integer(),
+    num_deletions := non_neg_integer(),
+    num_merge_operands := non_neg_integer(),
+    num_range_deletions := non_neg_integer(),
+    format_version := non_neg_integer(),
+    fixed_key_len := non_neg_integer(),
+    column_family_id := non_neg_integer(),
+    column_family_name := binary(),
+    filter_policy_name := binary(),
+    comparator_name := binary(),
+    merge_operator_name := binary(),
+    prefix_extractor_name := binary(),
+    property_collectors_names := binary(),
+    compression_name := binary(),
+    compression_options := binary(),
+    creation_time := non_neg_integer(),
+    oldest_key_time := non_neg_integer(),
+    file_creation_time := non_neg_integer(),
+    slow_compression_estimated_data_size := non_neg_integer(),
+    fast_compression_estimated_data_size := non_neg_integer(),
+    external_sst_file_global_seqno_offset := non_neg_integer()
+}.
 -opaque db_handle() :: reference() | binary().
 -opaque cf_handle() :: reference() | binary().
 -opaque itr_handle() :: reference() | binary().
@@ -264,25 +399,35 @@
 -opaque statistics_handle() :: reference() | binary().
 
 -type column_family() :: cf_handle() | default_column_family.
--type column_families() :: [cf_handle()].
+-type column_families() :: [column_family()].
 
--type env_type() :: default | memenv.
+-type env_type() :: default | memenv
+                  | {encrypted, Key :: <<_:256>>}
+                  | #{encrypted := Key :: <<_:256>>}.
 -opaque env() :: env_type() | env_handle().
 -type env_priority() :: priority_high | priority_low.
 
+-type compaction_options_fifo() :: [{max_table_files_size, pos_integer()} |
+                                    {allow_compaction, boolean()} |
+                                    %% RocksDB 11.0+
+                                    {max_data_files_size, non_neg_integer()} |
+                                    {use_kv_ratio_compaction, boolean()}].
+
+
+%% Note: RocksDB 11.0 dropped support for `format_version' < 2.
 -type block_based_table_options() :: [{no_block_cache, boolean()} |
                                       {block_size, pos_integer()} |
                                       {block_cache, cache_handle()} |
                                       {block_cache_size, pos_integer()} |
                                       {bloom_filter_policy, BitsPerKey :: pos_integer()} |
-                                      {format_version, 0 | 1 | 2 | 3 | 4 | 5} |
+                                      {format_version, 2 | 3 | 4 | 5 | 6 | 7} |
                                       {pin_l0_filter_and_index_blocks_in_cache, boolean()} |
                                       {partition_filters, boolean()} |
-                                      {cache_index_and_filter_blocks, boolean()}].
-
--type compaction_options_fifo() :: [{allow_compaction, boolean()} |
-                                    {age_for_warm, non_neg_integer()} |
-                                    {max_table_files_size, pos_integer()}].
+                                      {cache_index_and_filter_blocks, boolean()} |
+                                      %% RocksDB 11.0/11.1
+                                      {index_block_search_type, binary_search | interpolation | auto} |
+                                      {uniform_cv_threshold, float()} |
+                                      {prepopulate_block_cache, disable | flush_only | flush_and_compaction}].
 
 -type merge_operator() :: erlang_merge_operator |
                           bitset_merge_operator |
@@ -295,6 +440,26 @@
                      memtable_tier.
 
 -type prepopulate_blob_cache() :: disable | flush_only.
+
+%% Compaction Filter Types
+-type filter_rule() ::
+    {key_prefix, binary()} |
+    {key_suffix, binary()} |
+    {key_contains, binary()} |
+    {value_empty} |
+    {value_prefix, binary()} |
+    {ttl_from_key, Offset :: non_neg_integer(),
+                   Length :: non_neg_integer(),
+                   TTLSeconds :: non_neg_integer()} |
+    {always_delete}.
+
+-type filter_decision() :: keep | remove | {change_value, binary()}.
+
+-type compaction_filter_opts() ::
+    #{rules := [filter_rule()]} |
+    #{handler := pid(),
+      batch_size => pos_integer(),
+      timeout => pos_integer()}.
 
 -type cf_options() :: [{block_cache_size_mb_for_point_lookup, non_neg_integer()} |
                        {memtable_memory_budget, pos_integer()} |
@@ -330,6 +495,7 @@
                        {disable_auto_compactions,  boolean()} |
                        {compaction_style,  compaction_style()} |
                        {compaction_pri,  compaction_pri()} |
+                       {compaction_options_fifo, compaction_options_fifo()} |
                        {filter_deletes,  boolean()} |
                        {max_sequential_skip_in_iterations,  pos_integer()} |
                        {inplace_update_support,  boolean()} |
@@ -337,12 +503,15 @@
                        {table_factory_block_cache_size, pos_integer()} |
                        {in_memory_mode, boolean()} |
                        {block_based_table_options, block_based_table_options()} |
-                       {compaction_options_fifo, compaction_options_fifo()} |
                        {level_compaction_dynamic_level_bytes, boolean()} |
                        {optimize_filters_for_hits, boolean()} |
                        {prefix_extractor, {fixed_prefix_transform, integer()} | 
                                            {capped_prefix_transform, integer()}} |
-                       {merge_operator, merge_operator()}
+                       {merge_operator, merge_operator()} |
+                       {compaction_filter, compaction_filter_opts()} |
+                       {target_file_size_is_upper_bound, boolean()} |
+                       %% RocksDB 11.1+
+                       {memtable_batch_lookup_optimization, boolean()}
                       ].
 
 -type db_options() :: [{env, env()} |
@@ -395,6 +564,12 @@
                        {unordered_write, boolean()} |
                        {two_write_queues, boolean()} |
                        {statistics, statistics_handle()} |
+                       {max_manifest_space_amp_pct, integer()} |
+                       %% RocksDB 11.1+
+                       %% open_files_async requires skip_stats_update_on_db_open = true
+                       {open_files_async, boolean()} |
+                       {enforce_write_buffer_manager_during_recovery, boolean()} |
+                       {verify_manifest_content_on_close, boolean()} |
 
                        %% If false, fallocate() calls are bypassed, which disables file
                        %% preallocation. The file space preallocation is used to increase the file
@@ -413,7 +588,12 @@
                          {tailing, boolean()} |
                          {total_order_seek, boolean()} |
                          {prefix_same_as_start, boolean()} |
-                         {snapshot, snapshot_handle()}].
+                         {snapshot, snapshot_handle()} |
+                         {auto_refresh_iterator_with_snapshot, boolean()} |
+                         {auto_readahead_size, boolean()} |
+                         {readahead_size, non_neg_integer()} |
+                         {async_io, boolean()} |
+                         {allow_unprepared_value, boolean()}].
 
 -type write_options() :: [{sync, boolean()} |
                           {disable_wal, boolean()} |
@@ -429,11 +609,14 @@
                           {single_delete, ColumnFamilyHandle::cf_handle(), Key::binary()} |
                           clear].
 
+-type bottommost_level_compaction() :: skip | if_have_compaction_filter | force | force_optimized.
+
 -type compact_range_options()  :: [{exclusive_manual_compaction, boolean()} |
                                    {change_level, boolean()} |
                                    {target_level, integer()} |
                                    {allow_write_stall, boolean()} |
-                                   {max_subcompactions, non_neg_integer()}].
+                                   {max_subcompactions, non_neg_integer()} |
+                                   {bottommost_level_compaction, bottommost_level_compaction()}].
 
 -type flush_options() :: [{wait, boolean()} |
                           {allow_write_stall, boolean()}].
@@ -466,6 +649,147 @@
       stats_except_time_for_mutex |
       stats_all.
 
+-type blob_db_ticker() :: blob_db_num_put |
+      blob_db_num_write |
+      blob_db_num_get |
+      blob_db_num_multiget |
+      blob_db_num_seek |
+      blob_db_num_next |
+      blob_db_num_prev |
+      blob_db_num_keys_written |
+      blob_db_num_keys_read |
+      blob_db_bytes_written |
+      blob_db_bytes_read |
+      blob_db_write_inlined |
+      blob_db_write_inlined_ttl |
+      blob_db_write_blob |
+      blob_db_write_blob_ttl |
+      blob_db_blob_file_bytes_written |
+      blob_db_blob_file_bytes_read |
+      blob_db_blob_file_synced |
+      blob_db_blob_index_expired_count |
+      blob_db_blob_index_expired_size |
+      blob_db_blob_index_evicted_count |
+      blob_db_blob_index_evicted_size |
+      blob_db_gc_num_files |
+      blob_db_gc_num_new_files |
+      blob_db_gc_failures |
+      blob_db_gc_num_keys_relocated |
+      blob_db_gc_bytes_relocated |
+      blob_db_fifo_num_files_evicted |
+      blob_db_fifo_num_keys_evicted |
+      blob_db_fifo_bytes_evicted |
+      blob_db_cache_miss |
+      blob_db_cache_hit |
+      blob_db_cache_add |
+      blob_db_cache_add_failures |
+      blob_db_cache_bytes_read |
+      blob_db_cache_bytes_write.
+
+-type blob_db_histogram() :: blob_db_key_size |
+      blob_db_value_size |
+      blob_db_write_micros |
+      blob_db_get_micros |
+      blob_db_multiget_micros |
+      blob_db_seek_micros |
+      blob_db_next_micros |
+      blob_db_prev_micros |
+      blob_db_blob_file_write_micros |
+      blob_db_blob_file_read_micros |
+      blob_db_blob_file_sync_micros |
+      blob_db_compression_micros |
+      blob_db_decompression_micros.
+
+-type core_operation_histogram() :: db_get |
+      db_write |
+      db_multiget |
+      db_seek |
+      compaction_time |
+      flush_time.
+
+-type io_sync_histogram() :: sst_read_micros |
+      sst_write_micros |
+      table_sync_micros |
+      wal_file_sync_micros |
+      bytes_per_read |
+      bytes_per_write.
+
+-type transaction_histogram() :: num_op_per_transaction.
+
+-type compaction_ticker() :: compact_read_bytes |
+      compact_write_bytes |
+      flush_write_bytes |
+      compaction_key_drop_newer_entry |
+      compaction_key_drop_obsolete |
+      compaction_key_drop_range_del |
+      compaction_key_drop_user |
+      compaction_cancelled |
+      number_superversion_acquires |
+      number_superversion_releases.
+
+-type db_operation_ticker() :: number_keys_written |
+      number_keys_read |
+      number_keys_updated |
+      bytes_written |
+      bytes_read |
+      iter_bytes_read |
+      number_db_seek |
+      number_db_next |
+      number_db_prev |
+      number_db_seek_found |
+      number_db_next_found |
+      number_db_prev_found.
+
+-type block_cache_ticker() :: block_cache_miss |
+      block_cache_hit |
+      block_cache_add |
+      block_cache_add_failures |
+      block_cache_index_miss |
+      block_cache_index_hit |
+      block_cache_filter_miss |
+      block_cache_filter_hit |
+      block_cache_data_miss |
+      block_cache_data_hit |
+      block_cache_bytes_read |
+      block_cache_bytes_write.
+
+-type memtable_stall_ticker() :: memtable_hit |
+      memtable_miss |
+      stall_micros |
+      write_done_by_self |
+      write_done_by_other |
+      wal_file_synced.
+
+-type transaction_ticker() :: txn_prepare_mutex_overhead |
+      txn_old_commit_map_mutex_overhead |
+      txn_duplicate_key_overhead |
+      txn_snapshot_mutex_overhead |
+      txn_get_try_again.
+
+-type histogram_info() :: #{median => float(),
+                            percentile95 => float(),
+                            percentile99 => float(),
+                            average => float(),
+                            standard_deviation => float(),
+                            max => float(),
+                            count => non_neg_integer(),
+                            sum => non_neg_integer()}.
+
+-type blob_metadata() :: #{blob_file_number => non_neg_integer(),
+                           blob_file_name => binary(),
+                           blob_file_path => binary(),
+                           size => non_neg_integer(),
+                           total_blob_count => non_neg_integer(),
+                           total_blob_bytes => non_neg_integer(),
+                           garbage_blob_count => non_neg_integer(),
+                           garbage_blob_bytes => non_neg_integer()}.
+
+-type cf_metadata() :: #{size => non_neg_integer(),
+                         file_count => non_neg_integer(),
+                         name => binary(),
+                         blob_file_size => non_neg_integer(),
+                         blob_files => [blob_metadata()]}.
+
 -compile(no_native).
 -on_load(on_load/0).
 
@@ -475,34 +799,18 @@ nif_stub_error(Line) ->
 
 -spec on_load() -> ok | {error, any()}.
 on_load() ->
-  Name = "liberocksdb",
-  Files = [filename:join(["priv", Name]),
-           filename:join(["..", "priv", Name]) |
-           case code:priv_dir(?MODULE) of
-             {error, bad_name} ->
-               case code:which(?MODULE) of
-                 Filename when is_list(Filename) ->
-                   [filename:join([filename:dirname(Filename), "..", "priv", Name])];
-                 _ ->
-                   []
-               end;
-             Path ->
-               [filename:join(Path, Name)]
-           end],
-  case find_lib(Files) of
-    false ->
-      io:format(standard_error, "failed_to_find_liberocksdb ~n~p~n", [Files]),
-      error(failed_to_find_liberocksdb);
-    SoName ->
-      erlang:load_nif(SoName, application:get_all_env(rocksdb))
-  end.
-
-find_lib([]) -> false;
-find_lib([F | Rest]) ->
-    case filelib:is_regular(F ++ ".so") orelse filelib:is_regular(F ++ ".dll") of
-        true -> F;
-        false -> find_lib(Rest)
-    end.
+  SoName = case code:priv_dir(?MODULE) of
+         {error, bad_name} ->
+           case code:which(?MODULE) of
+             Filename when is_list(Filename) ->
+               filename:join([filename:dirname(Filename),"../priv", "liberocksdb"]);
+             _ ->
+               filename:join("../priv", "liberocksdb")
+           end;
+         Dir ->
+           filename:join(Dir, "liberocksdb")
+       end,
+  erlang:load_nif(SoName, application:get_all_env(rocksdb)).
 
 %%--------------------------------------------------------------------
 %%% API
@@ -541,9 +849,6 @@ open(_Name, _DBOpts, _CFDescriptors) ->
 open_readonly(_Name, _DBOpts, _CFDescriptors) ->
   ?nif_stub.
 
-open_with_cf(Name, DbOpts, CFDescriptors) ->
-  open(Name, DbOpts, CFDescriptors).
-
 open_with_cf_readonly(Name, DbOpts, CFDescriptors) ->
   open_readonly(Name, DbOpts, CFDescriptors).
 
@@ -580,6 +885,53 @@ open_optimistic_transaction_db(_Name, _DbOpts, _CFDescriptors) ->
 open_with_ttl(_Name, _DBOpts, _TTL, _ReadOnly) ->
   ?nif_stub.
 
+%% @doc Open a RocksDB database with TTL support and multiple column families.
+%% Each column family can have its own TTL value.
+%% @see open_with_ttl/4
+-spec open_with_ttl_cf(Name, DBOpts, CFDescriptors, ReadOnly) ->
+       {ok, db_handle(), [cf_handle()]} | {error, any()}
+         when Name :: file:filename_all(),
+              DBOpts :: db_options(),
+              CFDescriptors :: [{Name :: string(), CFOpts :: cf_options(), TTL :: integer()}],
+              ReadOnly :: boolean().
+open_with_ttl_cf(_Name, _DBOpts, _CFDescriptors, _ReadOnly) ->
+  ?nif_stub.
+
+%% @doc Get the current TTL for a column family in a TTL database.
+%% Returns the TTL in seconds.
+-spec get_ttl(DBHandle, CFHandle) -> {ok, integer()} | {error, any()}
+         when DBHandle :: db_handle(),
+              CFHandle :: cf_handle().
+get_ttl(_DBHandle, _CFHandle) ->
+  ?nif_stub.
+
+%% @doc Set the default TTL for a TTL database.
+%% The TTL is specified in seconds.
+-spec set_ttl(DBHandle, TTL) -> ok | {error, any()}
+         when DBHandle :: db_handle(),
+              TTL :: integer().
+set_ttl(_DBHandle, _TTL) ->
+  ?nif_stub.
+
+%% @doc Set the TTL for a specific column family in a TTL database.
+%% The TTL is specified in seconds.
+-spec set_ttl(DBHandle, CFHandle, TTL) -> ok | {error, any()}
+         when DBHandle :: db_handle(),
+              CFHandle :: cf_handle(),
+              TTL :: integer().
+set_ttl(_DBHandle, _CFHandle, _TTL) ->
+  ?nif_stub.
+
+%% @doc Create a new column family with a specific TTL in a TTL database.
+%% The TTL is specified in seconds.
+-spec create_column_family_with_ttl(DBHandle, Name, CFOpts, TTL) ->
+       {ok, cf_handle()} | {error, any()}
+         when DBHandle :: db_handle(),
+              Name :: string(),
+              CFOpts :: cf_options(),
+              TTL :: integer().
+create_column_family_with_ttl(_DBHandle, _Name, _CFOpts, _TTL) ->
+  ?nif_stub.
 
 %% @doc Close RocksDB
 -spec close(DBHandle) -> Res when
@@ -626,13 +978,18 @@ drop_column_family(_DbHandle, _CFHandle) ->
 destroy_column_family(_DBHandle, _CFHandle) ->
   ?nif_stub.
 
-drop_column_family(_CFHandle) ->
+%% @doc Get column family metadata including blob file information.
+-spec get_column_family_metadata(DBHandle) -> {ok, cf_metadata()} when
+  DBHandle :: db_handle().
+get_column_family_metadata(_DBHandle) ->
   ?nif_stub.
 
-destroy_column_family(_CFHandle) ->
+%% @doc Get column family metadata for a specific column family.
+-spec get_column_family_metadata(DBHandle, CFHandle) -> {ok, cf_metadata()} when
+  DBHandle :: db_handle(),
+  CFHandle :: cf_handle().
+get_column_family_metadata(_DBHandle, _CFHandle) ->
   ?nif_stub.
-
-
 
 %% @doc return a database snapshot
 %% Snapshots provide consistent read-only views over the entire state of the key-value store
@@ -672,25 +1029,45 @@ put(_DBHandle, _CFHandle, _Key, _Value, _WriteOpts) ->
    ?nif_stub.
 
 %% @doc Merge a key/value pair into the default column family
+%% For posting list operations, Value can be:
+%% - `{posting_add, Key}' to add a key to the posting list
+%% - `{posting_delete, Key}' to mark a key as tombstoned
 -spec merge(DBHandle, Key, Value, WriteOpts) -> Res when
   DBHandle::db_handle(),
   Key::binary(),
-  Value::binary(),
+  Value::binary() | {posting_add, binary()} | {posting_delete, binary()},
   WriteOpts::write_options(),
   Res :: ok | {error, any()}.
-merge(_DBHandle, _Key, _Value, _WriteOpts) ->
-  ?nif_stub.
+merge(DBHandle, Key, Value, WriteOpts) ->
+  merge_nif(DBHandle, Key, encode_merge_value(Value), WriteOpts).
 
 %% @doc Merge a key/value pair into the specified column family
+%% For posting list operations, Value can be:
+%% - `{posting_add, Key}' to add a key to the posting list
+%% - `{posting_delete, Key}' to mark a key as tombstoned
 -spec merge(DBHandle, CFHandle, Key, Value, WriteOpts) -> Res when
   DBHandle::db_handle(),
   CFHandle::cf_handle(),
   Key::binary(),
-  Value::binary(),
+  Value::binary() | {posting_add, binary()} | {posting_delete, binary()},
   WriteOpts::write_options(),
   Res :: ok | {error, any()}.
-merge(_DBHandle, _CFHandle, _Key, _Value, _WriteOpts) ->
-   ?nif_stub.
+merge(DBHandle, CFHandle, Key, Value, WriteOpts) ->
+   merge_nif(DBHandle, CFHandle, Key, encode_merge_value(Value), WriteOpts).
+
+%% Internal NIF stubs for merge
+merge_nif(_DBHandle, _Key, _Value, _WriteOpts) ->
+  ?nif_stub.
+merge_nif(_DBHandle, _CFHandle, _Key, _Value, _WriteOpts) ->
+  ?nif_stub.
+
+%% Encode merge value - convert posting list tuples to term_to_binary format
+encode_merge_value({posting_add, Key}) when is_binary(Key) ->
+  term_to_binary({posting_add, Key});
+encode_merge_value({posting_delete, Key}) when is_binary(Key) ->
+  term_to_binary({posting_delete, Key});
+encode_merge_value(Value) when is_binary(Value) ->
+  Value.
 
 %% @doc Delete a key/value pair in the default column family
 -spec(delete(DBHandle, Key, WriteOpts) ->
@@ -743,49 +1120,6 @@ single_delete(_DBHandle, _Key, _WriteOpts) ->
 single_delete(_DBHandle, _CFHandle, _Key, _WriteOpts) ->
   ?nif_stub.
 
-%% @doc Apply the specified updates to the database.
-%% this function will be removed on the next major release. You should use the `batch_*' API instead.
--spec write(DBHandle, WriteActions, WriteOpts) -> Res when
-  DBHandle::db_handle(),
-   WriteActions::write_actions(),
-   WriteOpts::write_options(),
-   Res :: ok | {error, any()}.
-write(DBHandle, WriteOps, WriteOpts) ->
-  {ok, Batch} = batch(),
-  try write_1(WriteOps, Batch, DBHandle, WriteOpts)
-  after release_batch(Batch)
-  end.
-
-write_1([{put, Key, Value} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_put(Batch, Key, Value),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([{put, CfHandle, Key, Value} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_put(Batch, CfHandle, Key, Value),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([{merge, Key, Value} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_merge(Batch, Key, Value),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([{merge, CfHandle, Key, Value} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_merge(Batch, CfHandle, Key, Value),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([{delete, Key} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_delete(Batch, Key),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([{delete, CfHandle, Key} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_delete(Batch, CfHandle, Key),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([{single_delete, Key} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_single_delete(Batch, Key),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([{single_delete, CfHandle, Key} | Rest], Batch, DbHandle, WriteOpts) ->
-  batch_single_delete(Batch, CfHandle, Key),
-  write_1(Rest, Batch, DbHandle, WriteOpts);
-write_1([_ | _], _Batch, _DbHandle, _WriteOpts) ->
-  erlang:error(badarg);
-write_1([], Batch, DbHandle, WriteOpts) ->
-  write_batch(DbHandle, Batch, WriteOpts).
-
-
 %% @doc Retrieve a key/value pair in the default column family
 -spec get(DBHandle, Key, ReadOpts) ->  Res when
   DBHandle::db_handle(),
@@ -803,6 +1137,71 @@ get(_DBHandle, _Key, _ReadOpts) ->
   ReadOpts::read_options(),
   Res :: {ok, binary()} | not_found | {error, {corruption, string()}} | {error, any()}.
 get(_DBHandle, _CFHandle, _Key, _ReadOpts) ->
+  ?nif_stub.
+
+%% @doc Retrieve multiple key/value pairs in a single call.
+%% Returns a list of results in the same order as the input keys.
+%% Each result is either `{ok, Value}', `not_found', or `{error, Reason}'.
+%% This is more efficient than calling get/3 multiple times.
+-spec multi_get(DBHandle, Keys, ReadOpts) -> Results when
+  DBHandle :: db_handle(),
+  Keys :: [binary()],
+  ReadOpts :: read_options(),
+  Results :: [{ok, binary()} | not_found | {error, any()}].
+multi_get(_DBHandle, _Keys, _ReadOpts) ->
+  ?nif_stub.
+
+%% @doc Retrieve multiple key/value pairs from a specific column family.
+%% Returns a list of results in the same order as the input keys.
+-spec multi_get(DBHandle, CFHandle, Keys, ReadOpts) -> Results when
+  DBHandle :: db_handle(),
+  CFHandle :: cf_handle(),
+  Keys :: [binary()],
+  ReadOpts :: read_options(),
+  Results :: [{ok, binary()} | not_found | {error, any()}].
+multi_get(_DBHandle, _CFHandle, _Keys, _ReadOpts) ->
+  ?nif_stub.
+
+%% @doc Put an entity (wide-column key) in the default column family.
+%% An entity is a key with multiple named columns stored as a proplist.
+-spec put_entity(DBHandle, Key, Columns, WriteOpts) -> Res when
+  DBHandle::db_handle(),
+  Key::binary(),
+  Columns::[{binary(), binary()}],
+  WriteOpts::write_options(),
+  Res :: ok | {error, any()}.
+put_entity(_DBHandle, _Key, _Columns, _WriteOpts) ->
+  ?nif_stub.
+
+%% @doc Put an entity (wide-column key) in the specified column family.
+-spec put_entity(DBHandle, CFHandle, Key, Columns, WriteOpts) -> Res when
+  DBHandle::db_handle(),
+  CFHandle::cf_handle(),
+  Key::binary(),
+  Columns::[{binary(), binary()}],
+  WriteOpts::write_options(),
+  Res :: ok | {error, any()}.
+put_entity(_DBHandle, _CFHandle, _Key, _Columns, _WriteOpts) ->
+  ?nif_stub.
+
+%% @doc Retrieve an entity (wide-column key) from the default column family.
+%% Returns the columns as a proplist of {Name, Value} tuples.
+-spec get_entity(DBHandle, Key, ReadOpts) -> Res when
+  DBHandle::db_handle(),
+  Key::binary(),
+  ReadOpts::read_options(),
+  Res :: {ok, [{binary(), binary()}]} | not_found | {error, any()}.
+get_entity(_DBHandle, _Key, _ReadOpts) ->
+  ?nif_stub.
+
+%% @doc Retrieve an entity (wide-column key) from the specified column family.
+-spec get_entity(DBHandle, CFHandle, Key, ReadOpts) -> Res when
+  DBHandle::db_handle(),
+  CFHandle::cf_handle(),
+  Key::binary(),
+  ReadOpts::read_options(),
+  Res :: {ok, [{binary(), binary()}]} | not_found | {error, any()}.
+get_entity(_DBHandle, _CFHandle, _Key, _ReadOpts) ->
   ?nif_stub.
 
 
@@ -956,6 +1355,17 @@ iterator(_DBHandle, _CfHandle, _ReadOpts) ->
 iterators(_DBHandle, _CFHandle, _ReadOpts) ->
   ?nif_stub.
 
+%% @doc
+%% Return a coalescing iterator over multiple column families.
+%% The iterator merges results from all column families and returns
+%% keys in sorted order. When the same key exists in multiple column
+%% families, only one value is returned (from the first CF in the list).
+-spec(coalescing_iterator(DBHandle, CFHandles, ReadOpts) ->
+             {ok, itr_handle()} | {error, any()} when DBHandle::db_handle(),
+                                                      CFHandles::[cf_handle()],
+                                                      ReadOpts::read_options()).
+coalescing_iterator(_DBHandle, _CFHandles, _ReadOpts) ->
+  ?nif_stub.
 
 %% @doc
 %% Move to the specified place
@@ -974,87 +1384,49 @@ iterator_move(_ITRHandle, _ITRAction) ->
 iterator_refresh(_ITRHandle) ->
     ?nif_stub.
 
+%% @doc Load the blob value for the current iterator position.
+%% Use with `{allow_unprepared_value, true}' to enable efficient key-only
+%% scanning with selective value loading.
+-spec(iterator_prepare_value(ITRHandle) -> ok | {error, any()} when ITRHandle::itr_handle()).
+iterator_prepare_value(_ITRHandle) ->
+    ?nif_stub.
+
 %% @doc
 %% Close a iterator
--spec(iterator_close(ITRHandle) -> ok when ITRHandle::itr_handle()).
+-spec(iterator_close(ITRHandle) -> ok | {error, _} when ITRHandle::itr_handle()).
 iterator_close(_ITRHandle) ->
     ?nif_stub.
 
--type fold_fun() :: fun(({Key::binary(), Value::binary()}, any()) -> any()).
+%% @doc Get the columns of the current iterator entry.
+%% Returns the wide columns for the current entry. For entities, returns
+%% all columns. For regular key-values, returns a single column with an
+%% empty name (the default column) containing the value.
+-spec iterator_columns(ITRHandle) -> Res when
+    ITRHandle::itr_handle(),
+    Res :: {ok, [{binary(), binary()}]} | {error, any()}.
+iterator_columns(_ITRHandle) ->
+    ?nif_stub.
 
-%% @doc Calls Fun(Elem, AccIn) on successive elements in the default column family
-%% starting with AccIn == Acc0.
-%% Fun/2 must return a new accumulator which is passed to the next call.
-%% The function returns the final value of the accumulator.
-%% Acc0 is returned if the default column family is empty.
-%%
-%% this function is deprecated and will be removed in next major release.
-%% You should use the `iterator' API instead.
--spec fold(DBHandle, Fun, AccIn, ReadOpts) -> AccOut when
-  DBHandle::db_handle(),
-  Fun::fold_fun(),
-  AccIn::any(),
-  ReadOpts::read_options(),
-  AccOut :: any().
-fold(DBHandle, Fun, Acc0, ReadOpts) ->
-  {ok, Itr} = iterator(DBHandle, ReadOpts),
-  do_fold(Itr, Fun, Acc0).
+%% @doc Delete an entity (same as regular delete).
+%% Entities are deleted using the normal delete operation - all columns
+%% are removed when the key is deleted.
+-spec delete_entity(DBHandle, Key, WriteOpts) -> Res when
+    DBHandle::db_handle(),
+    Key::binary(),
+    WriteOpts::write_options(),
+    Res :: ok | {error, any()}.
+delete_entity(DBHandle, Key, WriteOpts) ->
+    delete(DBHandle, Key, WriteOpts).
 
-%% @doc Calls Fun(Elem, AccIn) on successive elements in the specified column family
-%% Other specs are same with fold/4
-%%
-%% this function is deprecated and will be removed in next major release.
-%% You should use the `iterator' API instead.
--spec fold(DBHandle, CFHandle, Fun, AccIn, ReadOpts) -> AccOut when
-  DBHandle::db_handle(),
-  CFHandle::cf_handle(),
-  Fun::fold_fun(),
-  AccIn::any(),
-  ReadOpts::read_options(),
-  AccOut :: any().
-fold(DbHandle, CFHandle, Fun, Acc0, ReadOpts) ->
-  {ok, Itr} = iterator(DbHandle, CFHandle, ReadOpts),
-  do_fold(Itr, Fun, Acc0).
-
--type fold_keys_fun() :: fun((Key::binary(), any()) -> any()).
-
-%% @doc Calls Fun(Elem, AccIn) on successive elements in the default column family
-%% starting with AccIn == Acc0.
-%% Fun/2 must return a new accumulator which is passed to the next call.
-%% The function returns the final value of the accumulator.
-%% Acc0 is returned if the default column family is empty.
-%%
-%% this function is deprecated and will be removed in next major release.
-%% You should use the `iterator' API instead.
--spec fold_keys(DBHandle, Fun, AccIn, ReadOpts) -> AccOut when
-  DBHandle::db_handle(),
-  Fun::fold_keys_fun(),
-  AccIn::any(),
-  ReadOpts::read_options(),
-  AccOut :: any().
-fold_keys(DBHandle, UserFun, Acc0, ReadOpts) ->
-  WrapperFun = fun({K, _V}, Acc) -> UserFun(K, Acc);
-                  (Else, Acc) -> UserFun(Else, Acc) end,
-  {ok, Itr} = iterator(DBHandle, ReadOpts),
-  do_fold(Itr, WrapperFun, Acc0).
-
-%% @doc Calls Fun(Elem, AccIn) on successive elements in the specified column family
-%% Other specs are same with fold_keys/4
-%%
-%% this function is deprecated and will be removed in next major release.
-%% You should use the `iterator' API instead.
--spec fold_keys(DBHandle, CFHandle, Fun, AccIn, ReadOpts) -> AccOut when
-  DBHandle::db_handle(),
-  CFHandle::cf_handle(),
-  Fun::fold_keys_fun(),
-  AccIn::any(),
-  ReadOpts::read_options(),
-  AccOut :: any().
-fold_keys(DBHandle, CFHandle, UserFun, Acc0, ReadOpts) ->
-  WrapperFun = fun({K, _V}, Acc) -> UserFun(K, Acc);
-                  (Else, Acc) -> UserFun(Else, Acc) end,
-  {ok, Itr} = iterator(DBHandle, CFHandle, ReadOpts),
-  do_fold(Itr, WrapperFun, Acc0).
+%% @doc Delete an entity from a column family (same as regular delete).
+-spec delete_entity(DBHandle, CFHandle, Key, WriteOpts) -> Res when
+    DBHandle::db_handle(),
+    CFHandle::cf_handle(),
+    Key::binary(),
+    WriteOpts::write_options(),
+    Res :: ok | {error, any()}.
+delete_entity(DBHandle, CFHandle, Key, WriteOpts) ->
+    delete(DBHandle, CFHandle, Key, WriteOpts).
 
 %% @doc is the database empty
 -spec  is_empty(DBHandle::db_handle()) -> true | false.
@@ -1100,26 +1472,63 @@ flush(_DbHandle, _Cfs, _FlushOptions) ->
 sync_wal(_DbHandle) ->
   ?nif_stub.
 
+%% @doc Flush WAL with options.
+%% Options:
+%%   {sync, boolean()} - If true, calls SyncWAL() afterwards (default: false)
+%%   {rate_limiter_priority, io_low | io_mid | io_high | io_user | io_total} -
+%%       Rate limiter priority for IO operations (default: io_total which disables rate limiting)
+-type flush_wal_option() :: {sync, boolean()}
+                          | {rate_limiter_priority, io_low | io_mid | io_high | io_user | io_total}.
+-type flush_wal_options() :: [flush_wal_option()].
+-spec flush_wal(db_handle(), flush_wal_options()) -> ok | {error, term()}.
+flush_wal(_DbHandle, _Options) ->
+  ?nif_stub.
 
+%% @doc Return the list of compression types supported by this build.
+%% This queries RocksDB to determine which compression libraries were
+%% compiled in. Common types include: snappy, lz4, lz4h, zstd, zlib, bzip2, none.
+-spec supported_compressions() -> [compression_type()].
+supported_compressions() ->
+  ?nif_stub.
 
-%% @doc Return the approximate number of keys in the default column family.
-%% Implemented by calling GetIntProperty with "rocksdb.estimate-num-keys"
-%%
-%% this function is deprecated and will be removed in next major release.
--spec count(DBHandle::db_handle()) ->  non_neg_integer() | {error, any()}.
-count(DBHandle) ->
-  count_1(get_property(DBHandle, <<"rocksdb.estimate-num-keys">>)).
+%% @doc Pause all background work (flush, compaction) for the database.
+%% This is useful when you need to take a consistent backup.
+%% Use continue_background_work/1 to resume.
+-spec pause_background_work(db_handle()) -> ok | {error, term()}.
+pause_background_work(_DbHandle) ->
+  ?nif_stub.
 
-%% @doc
-%% Return the approximate number of keys in the specified column family.
-%%
-%% this function is deprecated and will be removed in next major release.
--spec count(DBHandle::db_handle(), CFHandle::cf_handle()) -> non_neg_integer() | {error, any()}.
-count(DBHandle, CFHandle) ->
-  count_1(get_property(DBHandle, CFHandle, <<"rocksdb.estimate-num-keys">>)).
+%% @doc Continue background work (flush, compaction) that was previously paused.
+%% Call this after pause_background_work/1 to resume normal operation.
+-spec continue_background_work(db_handle()) -> ok | {error, term()}.
+continue_background_work(_DbHandle) ->
+  ?nif_stub.
 
-count_1({ok, BinCount}) -> erlang:binary_to_integer(BinCount);
-count_1(Error) -> Error.
+%% @doc Disable manual compaction (CompactRange, CompactFiles).
+%% If a manual compaction is in progress, this will wait until it completes.
+-spec disable_manual_compaction(db_handle()) -> ok.
+disable_manual_compaction(_DbHandle) ->
+  ?nif_stub.
+
+%% @doc Re-enable manual compaction after it was disabled.
+-spec enable_manual_compaction(db_handle()) -> ok.
+enable_manual_compaction(_DbHandle) ->
+  ?nif_stub.
+
+%% @doc Abort all running and scheduled compactions (RocksDB 11.0+).
+%% In-progress compactions are actively cancelled and report a status for which
+%% `rocksdb:is_compaction_aborted/1' (a RocksDB `kCompactionAborted' status) is
+%% true. Call `resume_all_compactions/1' as many times as this was called to
+%% resume.
+-spec abort_all_compactions(db_handle()) -> ok | {error, term()}.
+abort_all_compactions(_DbHandle) ->
+  ?nif_stub.
+
+%% @doc Resume compactions previously aborted by `abort_all_compactions/1'
+%% (RocksDB 11.0+). Must be called as many times as `abort_all_compactions/1'.
+-spec resume_all_compactions(db_handle()) -> ok | {error, term()}.
+resume_all_compactions(_DbHandle) ->
+  ?nif_stub.
 
 %% @doc Return the current stats of the default column family
 %% Implemented by calling GetProperty with "rocksdb.stats"
@@ -1191,18 +1600,11 @@ tlog_next_update(_Iterator) ->
 write_binary_update(_DbHandle, _Update, _WriteOptions) ->
   ?nif_stub.
 
-
-
-updates_iterator(DBH, Since) -> tlog_iterator(DBH, Since).
-close_updates_iterator(Itr) -> tlog_iterator_close(Itr).
-next_binary_update(Itr) -> tlog_next_binary_update(Itr).
-next_update(Itr) -> tlog_next_update(Itr).
-
 %% ===================================================================
 %% Batch API
 
 %% @doc create a new batch in memory. A batch is a nif resource attached to the current process. Pay attention when you
-%% share it with other processes as it may not been released. To force its release you will need to use the close_batch
+%% share it with other processes as it may not been released. To force its release you will need to use the release_batch
 %% function.
 -spec batch() -> {ok, Batch :: batch_handle()}.
 batch() ->
@@ -1228,13 +1630,25 @@ batch_put(_Batch, _ColumnFamily, _Key, _Value) ->
   ?nif_stub.
 
 %% @doc add a merge operation to the batch
--spec batch_merge(Batch :: batch_handle(), Key :: binary(), Value :: binary()) -> ok.
-batch_merge(_Batch, _Key, _Value) ->
-  ?nif_stub.
+%% For posting list operations, Value can be:
+%% - `{posting_add, Key}' to add a key to the posting list
+%% - `{posting_delete, Key}' to mark a key as tombstoned
+-spec batch_merge(Batch :: batch_handle(), Key :: binary(), Value :: binary() | {posting_add, binary()} | {posting_delete, binary()}) -> ok.
+batch_merge(Batch, Key, Value) ->
+  batch_merge_nif(Batch, Key, encode_merge_value(Value)).
 
 %% @doc like `batch_mege/3' but apply the operation to a column family
--spec batch_merge(Batch :: batch_handle(), ColumnFamily :: cf_handle(), Key :: binary(), Value :: binary()) -> ok.
-batch_merge(_Batch, _ColumnFamily, _Key, _Value) ->
+%% For posting list operations, Value can be:
+%% - `{posting_add, Key}' to add a key to the posting list
+%% - `{posting_delete, Key}' to mark a key as tombstoned
+-spec batch_merge(Batch :: batch_handle(), ColumnFamily :: cf_handle(), Key :: binary(), Value :: binary() | {posting_add, binary()} | {posting_delete, binary()}) -> ok.
+batch_merge(Batch, ColumnFamily, Key, Value) ->
+  batch_merge_nif(Batch, ColumnFamily, Key, encode_merge_value(Value)).
+
+%% Internal NIF stubs for batch_merge
+batch_merge_nif(_Batch, _Key, _Value) ->
+  ?nif_stub.
+batch_merge_nif(_Batch, _ColumnFamily, _Key, _Value) ->
   ?nif_stub.
 
 %% @doc batch implementation of delete operation to the batch
@@ -1255,6 +1669,16 @@ batch_single_delete(_Batch, _Key) ->
 %% @doc like `batch_single_delete/2' but apply the operation to a column family
 -spec batch_single_delete(Batch :: batch_handle(), ColumnFamily :: cf_handle(), Key :: binary()) -> ok.
 batch_single_delete(_Batch, _ColumnFamily, _Key) ->
+  ?nif_stub.
+
+%% @doc Batch implementation of `delete_range/5'
+-spec batch_delete_range(Batch :: batch_handle(), Begin :: binary(), End :: binary()) -> ok.
+batch_delete_range(_Batch, _Begin, _End) ->
+  ?nif_stub.
+
+%% @doc Like `batch_delete_range/3' but apply the operation to a column family
+-spec batch_delete_range(Batch :: batch_handle(), ColumnFamily :: cf_handle(), Begin :: binary(), End :: binary()) -> ok.
+batch_delete_range(_Batch, _ColumnFamily, _Begin, _End) ->
   ?nif_stub.
 
 %% @doc return the number of operations in the batch
@@ -1338,6 +1762,70 @@ transaction_get(_Transaction, _Key, _Opts) ->
 transaction_get(_Transaction, _ColumnFamily, _Key, _Opts) ->
   ?nif_stub.
 
+%% @doc get a value and track the key for conflict detection at commit time.
+%% For optimistic transactions, this records the key so that if another
+%% transaction modifies it before commit, the commit will fail with a conflict.
+-spec transaction_get_for_update(Transaction :: transaction_handle(),
+                                  Key :: binary(),
+                                  Opts :: read_options()) ->
+          Res :: {ok, binary()} |
+                 not_found |
+                 {error, busy} |
+                 {error, {corruption, string()}} |
+                 {error, any()}.
+transaction_get_for_update(_Transaction, _Key, _Opts) ->
+  ?nif_stub.
+
+%% @doc like `transaction_get_for_update/3' but apply the operation to a column family
+-spec transaction_get_for_update(Transaction :: transaction_handle(),
+                                  ColumnFamily :: cf_handle(),
+                                  Key :: binary(),
+                                  Opts :: read_options()) ->
+          Res :: {ok, binary()} |
+                 not_found |
+                 {error, busy} |
+                 {error, {corruption, string()}} |
+                 {error, any()}.
+transaction_get_for_update(_Transaction, _ColumnFamily, _Key, _Opts) ->
+  ?nif_stub.
+
+%% @doc batch get multiple values within a transaction.
+%% Returns a list of results in the same order as the input keys.
+-spec transaction_multi_get(Transaction :: transaction_handle(),
+                             Keys :: [binary()],
+                             Opts :: read_options()) ->
+          [{ok, binary()} | not_found | {error, any()}].
+transaction_multi_get(_Transaction, _Keys, _Opts) ->
+  ?nif_stub.
+
+%% @doc like `transaction_multi_get/3' but apply the operation to a column family
+-spec transaction_multi_get(Transaction :: transaction_handle(),
+                             ColumnFamily :: cf_handle(),
+                             Keys :: [binary()],
+                             Opts :: read_options()) ->
+          [{ok, binary()} | not_found | {error, any()}].
+transaction_multi_get(_Transaction, _ColumnFamily, _Keys, _Opts) ->
+  ?nif_stub.
+
+%% @doc batch get multiple values and track keys for conflict detection.
+%% For optimistic transactions, this records the keys so that if another
+%% transaction modifies any of them before commit, the commit will fail.
+-spec transaction_multi_get_for_update(Transaction :: transaction_handle(),
+                                        Keys :: [binary()],
+                                        Opts :: read_options()) ->
+          [{ok, binary()} | not_found | {error, any()}].
+transaction_multi_get_for_update(_Transaction, _Keys, _Opts) ->
+  ?nif_stub.
+
+%% @doc like `transaction_multi_get_for_update/3' but apply to a column family
+-spec transaction_multi_get_for_update(Transaction :: transaction_handle(),
+                                        ColumnFamily :: cf_handle(),
+                                        Keys :: [binary()],
+                                        Opts :: read_options()) ->
+          [{ok, binary()} | not_found | {error, any()}].
+transaction_multi_get_for_update(_Transaction, _ColumnFamily, _Keys, _Opts) ->
+  ?nif_stub.
+
 %% see comment in c_src/transaction.cc
 
 %% %% @doc add a merge operation to the transaction
@@ -1391,6 +1879,223 @@ transaction_commit(_Transaction) ->
 %% @doc rollback a transaction to disk atomically (?)
 -spec transaction_rollback(Transaction :: transaction_handle()) -> ok | {error, term()}.
 transaction_rollback(_Transaction) ->
+  ?nif_stub.
+
+%% ===================================================================
+%% Pessimistic Transaction API
+
+%% @doc open a database with pessimistic transaction support.
+%% Pessimistic transactions acquire locks on keys when they are accessed,
+%% providing strict serializability at the cost of potential lock contention.
+-spec open_pessimistic_transaction_db(Name :: file:filename_all(), DbOpts :: db_options()) ->
+    {ok, db_handle(), [cf_handle()]} | {error, any()}.
+open_pessimistic_transaction_db(_Name, _DbOpts) ->
+  open_pessimistic_transaction_db(_Name, _DbOpts, [{"default", []}]).
+
+%% @doc open a database with pessimistic transaction support and column families.
+-spec open_pessimistic_transaction_db(Name :: file:filename_all(),
+                                       DbOpts :: db_options(),
+                                       CfDescriptors :: [cf_descriptor()]) ->
+    {ok, db_handle(), [cf_handle()]} | {error, any()}.
+open_pessimistic_transaction_db(_Name, _DbOpts, _CFDescriptors) ->
+  ?nif_stub.
+
+%% @doc create a new pessimistic transaction.
+%% Pessimistic transactions use row-level locking with deadlock detection.
+-spec pessimistic_transaction(TransactionDB :: db_handle(), WriteOptions :: write_options()) ->
+    {ok, transaction_handle()} | {error, any()}.
+pessimistic_transaction(_TransactionDB, _WriteOptions) ->
+  ?nif_stub.
+
+%% @doc create a new pessimistic transaction with transaction options.
+%% Transaction options include:
+%%   {set_snapshot, boolean()} - acquire a snapshot at start
+%%   {deadlock_detect, boolean()} - enable deadlock detection
+%%   {lock_timeout, integer()} - lock wait timeout in ms
+-spec pessimistic_transaction(TransactionDB :: db_handle(),
+                               WriteOptions :: write_options(),
+                               TxnOptions :: list()) ->
+    {ok, transaction_handle()} | {error, any()}.
+pessimistic_transaction(_TransactionDB, _WriteOptions, _TxnOptions) ->
+  ?nif_stub.
+
+%% @doc release a pessimistic transaction.
+-spec release_pessimistic_transaction(TransactionHandle :: transaction_handle()) -> ok.
+release_pessimistic_transaction(_TransactionHandle) ->
+  ?nif_stub.
+
+%% @doc put a key-value pair in the transaction.
+-spec pessimistic_transaction_put(Transaction :: transaction_handle(),
+                                   Key :: binary(),
+                                   Value :: binary()) ->
+    ok | {error, busy} | {error, timed_out} | {error, any()}.
+pessimistic_transaction_put(_Transaction, _Key, _Value) ->
+  ?nif_stub.
+
+%% @doc put a key-value pair in a column family within the transaction.
+-spec pessimistic_transaction_put(Transaction :: transaction_handle(),
+                                   ColumnFamily :: cf_handle(),
+                                   Key :: binary(),
+                                   Value :: binary()) ->
+    ok | {error, busy} | {error, timed_out} | {error, any()}.
+pessimistic_transaction_put(_Transaction, _ColumnFamily, _Key, _Value) ->
+  ?nif_stub.
+
+%% @doc get a value from the transaction (read without acquiring lock).
+-spec pessimistic_transaction_get(Transaction :: transaction_handle(),
+                                   Key :: binary(),
+                                   Opts :: read_options()) ->
+    {ok, binary()} | not_found | {error, any()}.
+pessimistic_transaction_get(_Transaction, _Key, _Opts) ->
+  ?nif_stub.
+
+%% @doc get a value from a column family within the transaction.
+-spec pessimistic_transaction_get(Transaction :: transaction_handle(),
+                                   ColumnFamily :: cf_handle(),
+                                   Key :: binary(),
+                                   Opts :: read_options()) ->
+    {ok, binary()} | not_found | {error, any()}.
+pessimistic_transaction_get(_Transaction, _ColumnFamily, _Key, _Opts) ->
+  ?nif_stub.
+
+%% @doc get a value and acquire an exclusive lock on the key.
+%% This is useful for read-modify-write patterns.
+-spec pessimistic_transaction_get_for_update(Transaction :: transaction_handle(),
+                                              Key :: binary(),
+                                              Opts :: read_options()) ->
+    {ok, binary()} | not_found | {error, busy} | {error, timed_out} | {error, any()}.
+pessimistic_transaction_get_for_update(_Transaction, _Key, _Opts) ->
+  ?nif_stub.
+
+%% @doc get a value from a column family and acquire an exclusive lock.
+-spec pessimistic_transaction_get_for_update(Transaction :: transaction_handle(),
+                                              ColumnFamily :: cf_handle(),
+                                              Key :: binary(),
+                                              Opts :: read_options()) ->
+    {ok, binary()} | not_found | {error, busy} | {error, timed_out} | {error, any()}.
+pessimistic_transaction_get_for_update(_Transaction, _ColumnFamily, _Key, _Opts) ->
+  ?nif_stub.
+
+%% @doc batch get multiple values within a pessimistic transaction.
+%% Returns a list of results in the same order as the input keys.
+%% This does not acquire locks on the keys.
+-spec pessimistic_transaction_multi_get(Transaction :: transaction_handle(),
+                                         Keys :: [binary()],
+                                         Opts :: read_options()) ->
+          [{ok, binary()} | not_found | {error, any()}].
+pessimistic_transaction_multi_get(_Transaction, _Keys, _Opts) ->
+  ?nif_stub.
+
+%% @doc like `pessimistic_transaction_multi_get/3' but apply to a column family
+-spec pessimistic_transaction_multi_get(Transaction :: transaction_handle(),
+                                         ColumnFamily :: cf_handle(),
+                                         Keys :: [binary()],
+                                         Opts :: read_options()) ->
+          [{ok, binary()} | not_found | {error, any()}].
+pessimistic_transaction_multi_get(_Transaction, _ColumnFamily, _Keys, _Opts) ->
+  ?nif_stub.
+
+%% @doc batch get multiple values and acquire exclusive locks on all keys.
+%% This is useful for read-modify-write patterns on multiple keys.
+-spec pessimistic_transaction_multi_get_for_update(Transaction :: transaction_handle(),
+                                                    Keys :: [binary()],
+                                                    Opts :: read_options()) ->
+          [{ok, binary()} | not_found | {error, busy} | {error, timed_out} | {error, any()}].
+pessimistic_transaction_multi_get_for_update(_Transaction, _Keys, _Opts) ->
+  ?nif_stub.
+
+%% @doc like `pessimistic_transaction_multi_get_for_update/3' but apply to a column family
+-spec pessimistic_transaction_multi_get_for_update(Transaction :: transaction_handle(),
+                                                    ColumnFamily :: cf_handle(),
+                                                    Keys :: [binary()],
+                                                    Opts :: read_options()) ->
+          [{ok, binary()} | not_found | {error, busy} | {error, timed_out} | {error, any()}].
+pessimistic_transaction_multi_get_for_update(_Transaction, _ColumnFamily, _Keys, _Opts) ->
+  ?nif_stub.
+
+%% @doc delete a key from the transaction.
+-spec pessimistic_transaction_delete(Transaction :: transaction_handle(),
+                                      Key :: binary()) ->
+    ok | {error, busy} | {error, timed_out} | {error, any()}.
+pessimistic_transaction_delete(_Transaction, _Key) ->
+  ?nif_stub.
+
+%% @doc delete a key from a column family within the transaction.
+-spec pessimistic_transaction_delete(Transaction :: transaction_handle(),
+                                      ColumnFamily :: cf_handle(),
+                                      Key :: binary()) ->
+    ok | {error, busy} | {error, timed_out} | {error, any()}.
+pessimistic_transaction_delete(_Transaction, _ColumnFamily, _Key) ->
+  ?nif_stub.
+
+%% @doc create an iterator over the transaction's view of the database.
+-spec pessimistic_transaction_iterator(TransactionHandle :: transaction_handle(),
+                                        ReadOpts :: read_options()) ->
+    {ok, itr_handle()} | {error, any()}.
+pessimistic_transaction_iterator(_TransactionHandle, _ReadOpts) ->
+  ?nif_stub.
+
+%% @doc create an iterator over a column family within the transaction.
+-spec pessimistic_transaction_iterator(TransactionHandle :: transaction_handle(),
+                                        CFHandle :: cf_handle(),
+                                        ReadOpts :: read_options()) ->
+    {ok, itr_handle()} | {error, any()}.
+pessimistic_transaction_iterator(_TransactionHandle, _CfHandle, _ReadOpts) ->
+  ?nif_stub.
+
+%% @doc commit the transaction atomically.
+-spec pessimistic_transaction_commit(Transaction :: transaction_handle()) ->
+    ok | {error, busy} | {error, expired} | {error, any()}.
+pessimistic_transaction_commit(_Transaction) ->
+  ?nif_stub.
+
+%% @doc rollback the transaction, discarding all changes.
+-spec pessimistic_transaction_rollback(Transaction :: transaction_handle()) ->
+    ok | {error, any()}.
+pessimistic_transaction_rollback(_Transaction) ->
+  ?nif_stub.
+
+%% @doc set a savepoint in a pessimistic transaction.
+%% Use {@link pessimistic_transaction_rollback_to_savepoint/1} to rollback to this point.
+-spec pessimistic_transaction_set_savepoint(Transaction :: transaction_handle()) -> ok.
+pessimistic_transaction_set_savepoint(_Transaction) ->
+  ?nif_stub.
+
+%% @doc rollback a pessimistic transaction to the most recent savepoint.
+%% All operations since the last call to {@link pessimistic_transaction_set_savepoint/1}
+%% are undone and the savepoint is removed.
+-spec pessimistic_transaction_rollback_to_savepoint(Transaction :: transaction_handle()) ->
+    ok | {error, any()}.
+pessimistic_transaction_rollback_to_savepoint(_Transaction) ->
+  ?nif_stub.
+
+%% @doc pop the most recent savepoint without rolling back.
+%% The savepoint is simply discarded.
+-spec pessimistic_transaction_pop_savepoint(Transaction :: transaction_handle()) ->
+    ok | {error, any()}.
+pessimistic_transaction_pop_savepoint(_Transaction) ->
+  ?nif_stub.
+
+%% @doc get the unique ID of a pessimistic transaction.
+%% This ID can be used to identify the transaction in deadlock detection
+%% and waiting transaction lists.
+-spec pessimistic_transaction_get_id(Transaction :: transaction_handle()) ->
+    {ok, non_neg_integer()}.
+pessimistic_transaction_get_id(_Transaction) ->
+  ?nif_stub.
+
+%% @doc get information about transactions this transaction is waiting on.
+%% Returns a map with:
+%% - `column_family_id': The column family ID of the key being waited on
+%% - `key': The key being waited on (binary)
+%% - `waiting_txns': List of transaction IDs that hold locks this transaction needs
+%%
+%% If the transaction is not currently waiting, returns an empty waiting_txns list.
+-spec pessimistic_transaction_get_waiting_txns(Transaction :: transaction_handle()) ->
+    {ok, #{column_family_id := non_neg_integer(),
+           key := binary(),
+           waiting_txns := [non_neg_integer()]}}.
+pessimistic_transaction_get_waiting_txns(_Transaction) ->
   ?nif_stub.
 
 %% ===================================================================
@@ -1549,12 +2254,6 @@ set_strict_capacity_limit(_Cache, _StrictCapacityLimit) ->
 release_cache(_Cache) ->
   ?nif_stub.
 
-new_lru_cache(Capacity) -> new_cache(lru, Capacity).
-new_clock_cache(Capacity) -> new_cache(clock, Capacity).
-get_usage(Cache) -> cache_info(Cache, usage).
-get_pinned_usage(Cache) -> cache_info(Cache, pinned_usage).
-get_capacity(Cache) -> cache_info(Cache, capacity).
-
 %% ===================================================================
 %% Limiter functions
 
@@ -1576,6 +2275,16 @@ release_rate_limiter(_Limiter) ->
 new_env() -> new_env(default).
 
 %% @doc return a db environment
+%%
+%% `default' returns the shared process-wide environment. `memenv' returns an
+%% in-memory environment.
+%%
+%% `{encrypted, Key}' (or `#{encrypted => Key}') returns an environment that
+%% transparently encrypts all on-disk data with AES-256-CTR. `Key' must be a
+%% 32-byte binary. Pass the returned handle as `{env, Env}' in the open
+%% options. Wrong-key detection is checksum-based, not authenticated: reading
+%% with the wrong key yields garbage that RocksDB block checksums reject as a
+%% corruption error.
 -spec new_env(EnvType :: env_type()) -> {ok, env_handle()}.
 new_env(_EnvType) ->
   ?nif_stub.
@@ -1609,10 +2318,6 @@ set_db_background_threads(_Db, _N) ->
 -spec set_db_background_threads(DB :: db_handle(), N :: non_neg_integer(), Priority :: env_priority()) -> ok.
 set_db_background_threads(_Db, _N, _PRIORITY) ->
   ?nif_stub.
-
-default_env() -> new_env(default).
-
-mem_env() -> new_env(memenv).
 
 %% ===================================================================
 %% SstFileManager functions
@@ -1710,6 +2415,279 @@ sst_file_manager_info(_SstFileManager) ->
 sst_file_manager_info(_SstFileManager, _Item) ->
   ?nif_stub.
 
+%% @doc Returns a list of all SST files being tracked and their sizes.
+%% Each element is a tuple of {FilePath, Size} where FilePath is a binary
+%% and Size is the file size in bytes.
+-spec sst_file_manager_tracked_files(SstFileManager) -> [{binary(), non_neg_integer()}] when
+    SstFileManager :: sst_file_manager().
+sst_file_manager_tracked_files(_SstFileManager) ->
+  ?nif_stub.
+
+
+%% ===================================================================
+%% SstFileWriter functions
+
+%% @doc Open a new SST file for writing.
+%%
+%% Creates an SST file writer that can be used to build SST files externally.
+%% Keys must be added in sorted order (according to the comparator).
+%% Once finished, the SST file can be ingested into the database using
+%% `ingest_external_file/3,4'.
+%%
+%% Options are the same as database options (compression, block_size, etc.)
+-spec sst_file_writer_open(Options, FilePath) -> Result when
+    Options :: db_options() | cf_options(),
+    FilePath :: file:filename_all(),
+    Result :: {ok, sst_file_writer()} | {error, any()}.
+sst_file_writer_open(_Options, _FilePath) ->
+  ?nif_stub.
+
+%% @doc Add a key-value pair to the SST file.
+%%
+%% IMPORTANT: Keys must be added in sorted order according to the comparator.
+%% Adding a key that is not greater than the previous key will result in an error.
+-spec sst_file_writer_put(SstFileWriter, Key, Value) -> Result when
+    SstFileWriter :: sst_file_writer(),
+    Key :: binary(),
+    Value :: binary(),
+    Result :: ok | {error, any()}.
+sst_file_writer_put(_SstFileWriter, _Key, _Value) ->
+  ?nif_stub.
+
+%% @doc Add a wide-column entity to the SST file.
+%%
+%% IMPORTANT: Keys must be added in sorted order according to the comparator.
+-spec sst_file_writer_put_entity(SstFileWriter, Key, Columns) -> Result when
+    SstFileWriter :: sst_file_writer(),
+    Key :: binary(),
+    Columns :: [{ColumnName :: binary(), ColumnValue :: binary()}],
+    Result :: ok | {error, any()}.
+sst_file_writer_put_entity(_SstFileWriter, _Key, _Columns) ->
+  ?nif_stub.
+
+%% @doc Add a merge operation to the SST file.
+%%
+%% IMPORTANT: Keys must be added in sorted order according to the comparator.
+-spec sst_file_writer_merge(SstFileWriter, Key, Value) -> Result when
+    SstFileWriter :: sst_file_writer(),
+    Key :: binary(),
+    Value :: binary(),
+    Result :: ok | {error, any()}.
+sst_file_writer_merge(_SstFileWriter, _Key, _Value) ->
+  ?nif_stub.
+
+%% @doc Add a delete tombstone to the SST file.
+%%
+%% IMPORTANT: Keys must be added in sorted order according to the comparator.
+-spec sst_file_writer_delete(SstFileWriter, Key) -> Result when
+    SstFileWriter :: sst_file_writer(),
+    Key :: binary(),
+    Result :: ok | {error, any()}.
+sst_file_writer_delete(_SstFileWriter, _Key) ->
+  ?nif_stub.
+
+%% @doc Add a range delete tombstone to the SST file.
+%%
+%% Deletes all keys in the range [BeginKey, EndKey).
+%% Range deletions can be added in any order.
+-spec sst_file_writer_delete_range(SstFileWriter, BeginKey, EndKey) -> Result when
+    SstFileWriter :: sst_file_writer(),
+    BeginKey :: binary(),
+    EndKey :: binary(),
+    Result :: ok | {error, any()}.
+sst_file_writer_delete_range(_SstFileWriter, _BeginKey, _EndKey) ->
+  ?nif_stub.
+
+%% @doc Finalize writing to the SST file and close it.
+%%
+%% After this call, the SST file is ready to be ingested into the database.
+-spec sst_file_writer_finish(SstFileWriter) -> Result when
+    SstFileWriter :: sst_file_writer(),
+    Result :: ok | {error, any()}.
+sst_file_writer_finish(_SstFileWriter) ->
+  ?nif_stub.
+
+%% @doc Finalize writing to the SST file and return file info.
+%%
+%% Returns a map with file metadata including:
+%% - file_path: Path to the created SST file
+%% - smallest_key: Smallest key in the file
+%% - largest_key: Largest key in the file
+%% - file_size: Size of the file in bytes
+%% - num_entries: Number of entries in the file
+%% - sequence_number: Sequence number assigned to keys
+-spec sst_file_writer_finish(SstFileWriter, with_file_info) -> Result when
+    SstFileWriter :: sst_file_writer(),
+    Result :: {ok, sst_file_info()} | {error, any()}.
+sst_file_writer_finish(_SstFileWriter, with_file_info) ->
+  ?nif_stub.
+
+%% @doc Get the current file size during writing.
+-spec sst_file_writer_file_size(SstFileWriter) -> Size when
+    SstFileWriter :: sst_file_writer(),
+    Size :: non_neg_integer().
+sst_file_writer_file_size(_SstFileWriter) ->
+  ?nif_stub.
+
+%% @doc Release the SST file writer resource.
+%%
+%% Note: If finish/1,2 was not called, the partially written file may remain.
+-spec release_sst_file_writer(SstFileWriter) -> ok when
+    SstFileWriter :: sst_file_writer().
+release_sst_file_writer(_SstFileWriter) ->
+  ?nif_stub.
+
+
+%% ===================================================================
+%% Ingest External File functions
+%% ===================================================================
+
+%% @doc Ingest external SST files into the database.
+%%
+%% This function loads one or more external SST files created by sst_file_writer
+%% into the database. The files are ingested at the appropriate level in the
+%% LSM tree based on their key ranges.
+%%
+%% Options:
+%% - move_files: Move files instead of copying (default: false)
+%% - failed_move_fall_back_to_copy: Fall back to copy if move fails (default: true)
+%% - snapshot_consistency: Check snapshot consistency (default: true)
+%% - allow_global_seqno: Allow assigning global sequence numbers (default: true)
+%% - allow_blocking_flush: Allow blocking flush (default: true)
+%% - ingest_behind: Ingest files to bottommost level (default: false)
+%% - verify_checksums_before_ingest: Verify checksums before ingest (default: true)
+%% - verify_checksums_readahead_size: Readahead size for checksum verification (default: 0)
+%% - verify_file_checksum: Verify file checksum if present (default: true)
+%% - fail_if_not_bottommost_level: Fail if files don't go to bottommost level (default: false)
+%% - allow_db_generated_files: Allow files generated by this DB (default: false)
+%% - fill_cache: Fill block cache on ingest (default: true)
+-spec ingest_external_file(DbHandle, Files, Options) -> Result when
+    DbHandle :: db_handle(),
+    Files :: [file:filename_all()],
+    Options :: [ingest_external_file_option()],
+    Result :: ok | {error, any()}.
+ingest_external_file(_DbHandle, _Files, _Options) ->
+  ?nif_stub.
+
+%% @doc Ingest external SST files into a specific column family.
+%%
+%% Same as ingest_external_file/3 but allows specifying a column family.
+-spec ingest_external_file(DbHandle, CfHandle, Files, Options) -> Result when
+    DbHandle :: db_handle(),
+    CfHandle :: cf_handle(),
+    Files :: [file:filename_all()],
+    Options :: [ingest_external_file_option()],
+    Result :: ok | {error, any()}.
+ingest_external_file(_DbHandle, _CfHandle, _Files, _Options) ->
+  ?nif_stub.
+
+
+%% ===================================================================
+%% SstFileReader functions
+%% ===================================================================
+
+%% @doc Open an SST file for reading.
+%%
+%% Creates an SST file reader that allows inspecting the contents of an SST file
+%% without loading it into a database. This is useful for offline verification,
+%% debugging, or extracting data from SST files.
+%%
+%% Options are the same as database options (compression, block_size, etc.)
+-spec sst_file_reader_open(Options, FilePath) -> Result when
+    Options :: db_options() | cf_options(),
+    FilePath :: file:filename_all(),
+    Result :: {ok, sst_file_reader()} | {error, any()}.
+sst_file_reader_open(_Options, _FilePath) ->
+  ?nif_stub.
+
+%% @doc Create an iterator for reading the contents of the SST file.
+%%
+%% Returns an iterator that can be used to scan through all key-value pairs
+%% in the SST file. The iterator supports the same movement operations as
+%% regular database iterators.
+%%
+%% Options:
+%% - verify_checksums: Verify block checksums during iteration (default: false)
+%% - fill_cache: Fill block cache during iteration (default: true)
+-spec sst_file_reader_iterator(SstFileReader, Options) -> Result when
+    SstFileReader :: sst_file_reader(),
+    Options :: read_options(),
+    Result :: {ok, sst_file_reader_itr()} | {error, any()}.
+sst_file_reader_iterator(_SstFileReader, _Options) ->
+  ?nif_stub.
+
+%% @doc Get the table properties of the SST file.
+%%
+%% Returns a map containing metadata about the SST file including:
+%% - data_size: Size of data blocks in bytes
+%% - index_size: Size of index blocks in bytes
+%% - filter_size: Size of filter block (if any)
+%% - num_entries: Number of key-value entries
+%% - num_deletions: Number of delete tombstones
+%% - compression_name: Name of compression algorithm used
+%% - creation_time: Unix timestamp when file was created
+%% And many more properties.
+-spec sst_file_reader_get_table_properties(SstFileReader) -> Result when
+    SstFileReader :: sst_file_reader(),
+    Result :: {ok, table_properties()} | {error, any()}.
+sst_file_reader_get_table_properties(_SstFileReader) ->
+  ?nif_stub.
+
+%% @doc Verify the checksums of all blocks in the SST file.
+%%
+%% Reads through all data blocks and verifies their checksums.
+%% Returns ok if all checksums are valid, or an error if any are corrupted.
+-spec sst_file_reader_verify_checksum(SstFileReader) -> Result when
+    SstFileReader :: sst_file_reader(),
+    Result :: ok | {error, any()}.
+sst_file_reader_verify_checksum(_SstFileReader) ->
+  ?nif_stub.
+
+%% @doc Verify the checksums of all blocks in the SST file.
+%%
+%% Same as verify_checksum/1 but with read options.
+-spec sst_file_reader_verify_checksum(SstFileReader, Options) -> Result when
+    SstFileReader :: sst_file_reader(),
+    Options :: read_options(),
+    Result :: ok | {error, any()}.
+sst_file_reader_verify_checksum(_SstFileReader, _Options) ->
+  ?nif_stub.
+
+%% @doc Move the SST file reader iterator to a new position.
+%%
+%% Supported actions:
+%% - first: Move to the first entry
+%% - last: Move to the last entry
+%% - next: Move to the next entry
+%% - prev: Move to the previous entry
+%% - {seek, Key}: Seek to the entry at or after Key
+%% - {seek_for_prev, Key}: Seek to the entry at or before Key
+%%
+%% Returns {ok, Key, Value} if the iterator is valid, or {error, Reason} if not.
+-spec sst_file_reader_iterator_move(Iterator, Action) -> Result when
+    Iterator :: sst_file_reader_itr(),
+    Action :: first | last | next | prev | {seek, binary()} | {seek_for_prev, binary()},
+    Result :: {ok, Key :: binary(), Value :: binary()} | {error, any()}.
+sst_file_reader_iterator_move(_Iterator, _Action) ->
+  ?nif_stub.
+
+%% @doc Close an SST file reader iterator.
+%%
+%% Releases resources associated with the iterator.
+-spec sst_file_reader_iterator_close(Iterator) -> ok when
+    Iterator :: sst_file_reader_itr().
+sst_file_reader_iterator_close(_Iterator) ->
+  ?nif_stub.
+
+%% @doc Release the SST file reader resource.
+%%
+%% Closes the SST file and releases all associated resources.
+%% Any iterators created from this reader will become invalid.
+-spec release_sst_file_reader(SstFileReader) -> ok when
+    SstFileReader :: sst_file_reader().
+release_sst_file_reader(_SstFileReader) ->
+  ?nif_stub.
+
 
 %% ===================================================================
 %% WriteBufferManager functions
@@ -1776,6 +2754,21 @@ set_stats_level(_StatisticsHandle, _StatsLevel) ->
 statistics_info(_Statistics) ->
   ?nif_stub.
 
+%% @doc Get the count for a specific statistics ticker.
+%% Returns the count for tickers such as blob_db_num_put, block_cache_hit,
+%% number_keys_written, compact_read_bytes, etc.
+-spec statistics_ticker(statistics_handle(), blob_db_ticker() | compaction_ticker() | db_operation_ticker() | block_cache_ticker() | memtable_stall_ticker() | transaction_ticker()) -> {ok, non_neg_integer()}.
+statistics_ticker(_Statistics, _Ticker) ->
+  ?nif_stub.
+
+%% @doc Get histogram data for a specific statistics histogram.
+%% Returns histogram information including median, percentiles, average, etc.
+%% For integrated BlobDB, relevant histograms are blob_db_blob_file_write_micros,
+%% blob_db_blob_file_read_micros, blob_db_compression_micros, etc.
+-spec statistics_histogram(statistics_handle(), blob_db_histogram() | core_operation_histogram() | io_sync_histogram() | transaction_histogram()) -> {ok, histogram_info()}.
+statistics_histogram(_Statistics, _Histogram) ->
+  ?nif_stub.
+
 
 %% @doc release the Statistics Handle
 -spec release_statistics(statistics_handle()) -> ok.
@@ -1783,22 +2776,241 @@ release_statistics(_Statistics) ->
     ?nif_stub.
 
 %% ===================================================================
+%% Compaction Filter
+%% ===================================================================
+
+%% @doc Reply to a compaction filter callback request.
+%% This function is called by the Erlang handler process when it has
+%% processed a batch of keys sent by the compaction filter.
+%%
+%% BatchRef is the reference received in the {compaction_filter, BatchRef, Keys} message.
+%% Decisions is a list of filter_decision() values corresponding to each key:
+%%   - keep: Keep the key-value pair
+%%   - remove: Delete the key-value pair
+%%   - {change_value, NewBinary}: Keep the key but replace the value
+%%
+%% Example handler:
+%% ```
+%% filter_handler() ->
+%%     receive
+%%         {compaction_filter, BatchRef, Keys} ->
+%%             Decisions = [decide(K, V) || {_Level, K, V} <- Keys],
+%%             rocksdb:compaction_filter_reply(BatchRef, Decisions),
+%%             filter_handler()
+%%     end.
+%%
+%% decide(<<"tmp_", _/binary>>, _Value) -> remove;
+%% decide(_Key, <<>>) -> remove;
+%% decide(_Key, Value) when byte_size(Value) > 1000 ->
+%%     {change_value, binary:part(Value, 0, 1000)};
+%% decide(_, _) -> keep.
+%% '''
+-spec compaction_filter_reply(reference(), [filter_decision()]) -> ok.
+compaction_filter_reply(_BatchRef, _Decisions) ->
+    ?nif_stub.
+
+
+%% ===================================================================
+%% Posting List API
+%% ===================================================================
+%%
+%% Posting lists are used for inverted indexes, search engines, and document
+%% tagging systems. Each posting list is a binary containing a sequence of
+%% entries with format: <<KeyLength:32/big, Flag:8, KeyData:KeyLength/binary>>
+%%
+%% Where Flag is 0 for normal entries and non-zero for tombstones.
+%%
+%% Use with {merge_operator, posting_list_merge_operator} and optionally
+%% {compaction_filter, #{rules => [{posting_list_tombstones}]}} to clean up
+%% tombstones during compaction.
+%% ===================================================================
+
+-type posting_entry() :: {Key :: binary(), IsTombstone :: boolean()}.
+
+%% @doc Decode a posting list binary to a list of entries.
+%% Returns all entries including tombstones, in order of appearance.
+-spec posting_list_decode(binary()) -> [posting_entry()].
+posting_list_decode(<<Len:32/big, Flag:8, Key:Len/binary, Rest/binary>>) ->
+    IsTombstone = Flag =/= 0,
+    [{Key, IsTombstone} | posting_list_decode(Rest)];
+posting_list_decode(<<>>) ->
+    [].
+
+%% @doc Fold over all entries in a posting list (including tombstones).
+-spec posting_list_fold(Fun, Acc, binary()) -> Acc when
+    Fun :: fun((Key :: binary(), IsTombstone :: boolean(), Acc) -> Acc),
+    Acc :: term().
+posting_list_fold(Fun, Acc, Bin) ->
+    lists:foldl(fun({K, T}, A) -> Fun(K, T, A) end, Acc, posting_list_decode(Bin)).
+
+%% @doc Get list of active keys (deduplicated, tombstones filtered out).
+%% This is a NIF function for efficiency.
+-spec posting_list_keys(binary()) -> [binary()].
+posting_list_keys(_Bin) ->
+    ?nif_stub.
+
+%% @doc Check if a key is active (exists and not tombstoned).
+%% This is a NIF function for efficiency.
+-spec posting_list_contains(binary(), binary()) -> boolean().
+posting_list_contains(_Bin, _Key) ->
+    ?nif_stub.
+
+%% @doc Find a key in the posting list.
+%% Returns {ok, IsTombstone} if found, or not_found if not present.
+%% This is a NIF function for efficiency.
+-spec posting_list_find(binary(), binary()) -> {ok, boolean()} | not_found.
+posting_list_find(_Bin, _Key) ->
+    ?nif_stub.
+
+%% @doc Count the number of active keys (not tombstoned).
+%% This is a NIF function for efficiency.
+-spec posting_list_count(binary()) -> non_neg_integer().
+posting_list_count(_Bin) ->
+    ?nif_stub.
+
+%% @doc Convert posting list to a map of key => active | tombstone.
+%% This is a NIF function for efficiency.
+-spec posting_list_to_map(binary()) -> #{binary() => active | tombstone}.
+posting_list_to_map(_Bin) ->
+    ?nif_stub.
+
+%% @doc Get the format version of a posting list binary.
+%% Returns 1 for V1 (legacy) format, 2 for V2 (sorted with roaring bitmap).
+-spec posting_list_version(binary()) -> 1 | 2.
+posting_list_version(_Bin) ->
+    ?nif_stub.
+
+%% @doc Compute intersection of two posting lists.
+%% Returns a new V2 posting list containing only keys present in both inputs.
+-spec posting_list_intersection(binary(), binary()) -> binary().
+posting_list_intersection(_Bin1, _Bin2) ->
+    ?nif_stub.
+
+%% @doc Compute union of two posting lists.
+%% Returns a new V2 posting list containing all keys from both inputs.
+-spec posting_list_union(binary(), binary()) -> binary().
+posting_list_union(_Bin1, _Bin2) ->
+    ?nif_stub.
+
+%% @doc Compute difference of two posting lists (Bin1 - Bin2).
+%% Returns keys that are in Bin1 but not in Bin2.
+-spec posting_list_difference(binary(), binary()) -> binary().
+posting_list_difference(_Bin1, _Bin2) ->
+    ?nif_stub.
+
+%% @doc Fast intersection count using roaring bitmap when available.
+%% For V2 posting lists, uses bitmap cardinality for O(1) performance.
+-spec posting_list_intersection_count(binary(), binary()) -> non_neg_integer().
+posting_list_intersection_count(_Bin1, _Bin2) ->
+    ?nif_stub.
+
+%% @doc Fast bitmap-based contains check.
+%% Uses hash lookup for V2 format - may have rare false positives.
+%% Use posting_list_contains/2 for exact checks.
+-spec posting_list_bitmap_contains(binary(), binary()) -> boolean().
+posting_list_bitmap_contains(_Bin, _Key) ->
+    ?nif_stub.
+
+%% @doc Intersect multiple posting lists efficiently.
+%% Processes lists from smallest to largest for optimal performance.
+-spec posting_list_intersect_all([binary()]) -> binary().
+posting_list_intersect_all([]) ->
+    %% Empty intersection - return empty V2 posting list
+    <<2, 0, 0, 0, 0, 0, 0, 0, 0>>;
+posting_list_intersect_all([Single]) ->
+    Single;
+posting_list_intersect_all(Lists) ->
+    %% Sort by size (smallest first) for optimal intersection
+    Sorted = lists:sort(fun(A, B) -> byte_size(A) =< byte_size(B) end, Lists),
+    lists:foldl(fun posting_list_intersection/2, hd(Sorted), tl(Sorted)).
+
+%% @doc Open/parse posting list binary into a resource for fast repeated lookups.
+%% Use this when you need to perform multiple contains checks on the same posting list.
+%% The resource holds parsed keys and bitmap for fast lookups.
+%% @end
+-spec postings_open(binary()) -> {ok, reference()} | {error, term()}.
+postings_open(_Bin) ->
+    ?nif_stub.
+
+%% @doc Check if key exists in postings resource (exact match).
+%% O(log n) lookup using sorted set.
+-spec postings_contains(reference(), binary()) -> boolean().
+postings_contains(_Postings, _Key) ->
+    ?nif_stub.
+
+%% @doc Check if key exists in postings resource (bitmap hash lookup).
+%% O(1) lookup but may have rare false positives due to hash collisions.
+-spec postings_bitmap_contains(reference(), binary()) -> boolean().
+postings_bitmap_contains(_Postings, _Key) ->
+    ?nif_stub.
+
+%% @doc Get count of keys in postings resource.
+-spec postings_count(reference()) -> non_neg_integer().
+postings_count(_Postings) ->
+    ?nif_stub.
+
+%% @doc Get all keys from postings resource (sorted).
+-spec postings_keys(reference()) -> [binary()].
+postings_keys(_Postings) ->
+    ?nif_stub.
+
+%% @doc Intersect two postings (AND).
+%% Accepts binary or resource, returns resource.
+-spec postings_intersection(binary() | reference(), binary() | reference()) ->
+    {ok, reference()} | {error, term()}.
+postings_intersection(A, B) ->
+    BinA = to_posting_binary(A),
+    BinB = to_posting_binary(B),
+    postings_open(posting_list_intersection(BinA, BinB)).
+
+%% @doc Union two postings (OR).
+%% Accepts binary or resource, returns resource.
+-spec postings_union(binary() | reference(), binary() | reference()) ->
+    {ok, reference()} | {error, term()}.
+postings_union(A, B) ->
+    BinA = to_posting_binary(A),
+    BinB = to_posting_binary(B),
+    postings_open(posting_list_union(BinA, BinB)).
+
+%% @doc Difference of two postings (A - B).
+%% Accepts binary or resource, returns resource.
+-spec postings_difference(binary() | reference(), binary() | reference()) ->
+    {ok, reference()} | {error, term()}.
+postings_difference(A, B) ->
+    BinA = to_posting_binary(A),
+    BinB = to_posting_binary(B),
+    postings_open(posting_list_difference(BinA, BinB)).
+
+%% @doc Fast intersection count using bitmap.
+-spec postings_intersection_count(binary() | reference(), binary() | reference()) ->
+    non_neg_integer().
+postings_intersection_count(A, B) ->
+    BinA = to_posting_binary(A),
+    BinB = to_posting_binary(B),
+    posting_list_intersection_count(BinA, BinB).
+
+%% @doc Intersect multiple postings efficiently.
+-spec postings_intersect_all([binary() | reference()]) -> {ok, reference()} | {error, term()}.
+postings_intersect_all([]) ->
+    postings_open(<<2, 0, 0, 0, 0, 0, 0, 0, 0>>);
+postings_intersect_all([Single]) when is_reference(Single) ->
+    {ok, Single};
+postings_intersect_all([Single]) ->
+    postings_open(Single);
+postings_intersect_all(List) ->
+    Bins = [to_posting_binary(X) || X <- List],
+    postings_open(posting_list_intersect_all(Bins)).
+
+
+%% ===================================================================
 %% Internal functions
 %% ===================================================================
-do_fold(Itr, Fun, Acc0) ->
-  try
-    fold_loop(iterator_move(Itr, first), Itr, Fun, Acc0)
-  after
-    iterator_close(Itr)
-  end.
 
-fold_loop({error, iterator_closed}, _Itr, _Fun, Acc0) ->
-  throw({iterator_closed, Acc0});
-fold_loop({error, invalid_iterator}, _Itr, _Fun, Acc0) ->
-  Acc0;
-fold_loop({ok, K}, Itr, Fun, Acc0) ->
-  Acc = Fun(K, Acc0),
-  fold_loop(iterator_move(Itr, next), Itr, Fun, Acc);
-fold_loop({ok, K, V}, Itr, Fun, Acc0) ->
-  Acc = Fun({K, V}, Acc0),
-  fold_loop(iterator_move(Itr, next), Itr, Fun, Acc).
+%% Convert postings (binary or resource) to binary
+to_posting_binary(Bin) when is_binary(Bin) -> Bin;
+to_posting_binary(Ref) when is_reference(Ref) -> postings_to_binary(Ref).
+
+%% @doc Convert postings resource back to binary (V2 format).
+-spec postings_to_binary(reference()) -> binary().
+postings_to_binary(_Postings) ->
+    ?nif_stub.

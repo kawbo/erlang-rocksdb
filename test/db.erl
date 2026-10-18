@@ -28,7 +28,7 @@ open_test_Z() ->
   ok = rocksdb:put(Ref, <<"abc">>, <<"123">>, []),
   false = rocksdb:is_empty(Ref),
   {ok, <<"123">>} = rocksdb:get(Ref, <<"abc">>, []),
-  {ok, 1} = rocksdb:count(Ref),
+  {ok, 1} = rocksdb_test_util:count(Ref),
   not_found = rocksdb:get(Ref, <<"def">>, []),
   ok = rocksdb:delete(Ref, <<"abc">>, []),
   not_found = rocksdb:get(Ref, <<"abc">>, []),
@@ -65,7 +65,7 @@ fold_test_Z() ->
   ok = rocksdb:put(Ref, <<"hij">>, <<"789">>, []),
   [{<<"abc">>, <<"123">>},
   {<<"def">>, <<"456">>},
-  {<<"hij">>, <<"789">>}] = lists:reverse(rocksdb:fold(Ref,
+  {<<"hij">>, <<"789">>}] = lists:reverse(rocksdb_test_util:fold(Ref,
   fun({K, V}, Acc) ->
     [{K, V} | Acc]
   end,
@@ -78,7 +78,7 @@ fold_keys_test_Z() ->
   ok = rocksdb:put(Ref, <<"def">>, <<"456">>, []),
   ok = rocksdb:put(Ref, <<"abc">>, <<"123">>, []),
   ok = rocksdb:put(Ref, <<"hij">>, <<"789">>, []),
-  [<<"abc">>, <<"def">>, <<"hij">>] = lists:reverse(rocksdb:fold_keys(Ref,
+  [<<"abc">>, <<"def">>, <<"hij">>] = lists:reverse(rocksdb_test_util:fold_keys(Ref,
   fun(K, Acc) -> [K | Acc] end,
   [], [])).
 
@@ -108,7 +108,7 @@ close_fold_test_Z() ->
   {ok, Ref} = rocksdb:open("erocksdb.close_fold.test", [{create_if_missing, true}], []),
   ok = rocksdb:put(Ref, <<"k">>,<<"v">>,[]),
   ?assertException(throw, {iterator_closed, ok}, % ok is returned by close as the acc
-                   rocksdb:fold(Ref, fun(_,_A) -> rocksdb:close(Ref) end, undefined, [])),
+                   rocksdb_test_util:fold(Ref, fun(_,_A) -> rocksdb:close(Ref) end, undefined, [])),
   ?rm_rf("erocksdb.close_fold.test").
 
 write_opts_test() ->
@@ -168,6 +168,44 @@ flush_test() ->
               , rocksdb:get_property(Ref, CF1, <<"rocksdb.num-entries-active-mem-table">>)),
   ?rm_rf(DBPath).
 
+flush_default_column_family_in_list_test() ->
+  DBPath = "erocksdb.flush_default_in_list.test",
+  ?rm_rf(DBPath),
+  {ok, Ref, [CFDef, CF1]} = rocksdb:open( DBPath
+                                        , [ {create_if_missing, true}
+                                          , {create_missing_column_families, true}
+                                          ]
+                                        , [ {"default", []},
+                                            {"cf1", []}
+                                          ]),
+  ?assertEqual(ok, rocksdb:put(Ref, CFDef, <<"k1">>, <<"v1">>, [])),
+  ?assertEqual(ok, rocksdb:put(Ref, CF1, <<"k2">>, <<"v2">>, [])),
+  ?assertEqual( ok
+              , rocksdb:flush(Ref, [default_column_family, CF1], [{wait, true}])),
+  ?assertEqual( {ok, <<"0">>}
+              , rocksdb:get_property(Ref, <<"rocksdb.num-entries-active-mem-table">>)),
+  ?assertEqual( {ok, <<"0">>}
+              , rocksdb:get_property(Ref, CF1, <<"rocksdb.num-entries-active-mem-table">>)),
+  ok = rocksdb:close(Ref),
+  ?rm_rf(DBPath).
+
+flush_improper_list_test() ->
+  DBPath = "erocksdb.flush_improper_list.test",
+  ?rm_rf(DBPath),
+  {ok, Ref, [_CFDef, CF1]} = rocksdb:open( DBPath
+                                         , [ {create_if_missing, true}
+                                           , {create_missing_column_families, true}
+                                           ]
+                                         , [ {"default", []},
+                                             {"cf1", []}
+                                           ]),
+  ?assertEqual(ok, rocksdb:put(Ref, CF1, <<"k1">>, <<"v1">>, [])),
+  ?assertError(badarg, rocksdb:flush(Ref, [CF1 | foo], [{wait, true}])),
+  ?assertEqual( {ok, <<"1">>}
+              , rocksdb:get_property(Ref, CF1, <<"rocksdb.num-entries-active-mem-table">>)),
+  ok = rocksdb:close(Ref),
+  ?rm_rf(DBPath).
+
 fixed_prefix_extractor_test() ->
   ?rm_rf("erocksdb.fixed_prefix_extractor.test"),
   {ok, Ref} = rocksdb:open("erocksdb.fixed_prefix_extractor.test", [{create_if_missing, true}, {prefix_extractor,
@@ -176,7 +214,7 @@ fixed_prefix_extractor_test() ->
   ok = rocksdb:put(Ref, <<"k1">>, <<"v1">>, []),
   ok = rocksdb:put(Ref, <<"k2">>, <<"v2">>, []),
 
-  [<<"k1">>, <<"k2">>] = lists:reverse(rocksdb:fold_keys(Ref,
+  [<<"k1">>, <<"k2">>] = lists:reverse(rocksdb_test_util:fold_keys(Ref,
                                                          fun(K, Acc) -> [K | Acc] end,
                                                          [], [])),
 
@@ -194,7 +232,7 @@ capped_prefix_extractor_test() ->
   ok = rocksdb:put(Ref, <<"k1">>, <<"v1">>, []),
   ok = rocksdb:put(Ref, <<"k2">>, <<"v2">>, []),
 
-  [<<"k1">>, <<"k2">>] = lists:reverse(rocksdb:fold_keys(Ref,
+  [<<"k1">>, <<"k2">>] = lists:reverse(rocksdb_test_util:fold_keys(Ref,
                                                          fun(K, Acc) -> [K | Acc] end,
                                                          [], [])),
 

@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2022 Benoit Chesneau
+// Copyright (c) 2016-2026 Benoit Chesneau
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -18,22 +18,16 @@
 #include <mutex>
 #include <memory>
 
-#include "rocksdb/version.h"
-#if ROCKSDB_MAJOR < 8
-#include "rocksdb/cache.h"
-#else
-#include "rocksdb/advanced_cache.h"
-#endif
-
 #include "erl_nif.h"
 
-namespace erocksdb {
+#include "rocksdb/cache.h"
+#include "rocksdb/advanced_cache.h"
 
-#if ROCKSDB_MAJOR < 8
-  typedef std::shared_ptr<rocksdb::Cache> RocksDBCachePtr;
-#else
-  typedef std::shared_ptr<rocksdb::BlockCache> RocksDBCachePtr;
-#endif
+namespace rocksdb {
+    class Cache;
+}
+
+namespace erocksdb {
 
   class Cache {
     protected:
@@ -42,20 +36,20 @@ namespace erocksdb {
     public:
       std::mutex mu;
 
-      explicit Cache(RocksDBCachePtr cache);
+      explicit Cache(std::shared_ptr<rocksdb::Cache> cache);
 
       ~Cache();
 
-      RocksDBCachePtr cache();
+      std::shared_ptr<rocksdb::Cache> cache();
 
       static void CreateCacheType(ErlNifEnv * Env);
       static void CacheResourceCleanup(ErlNifEnv *Env, void * Arg);
 
-      static Cache * CreateCacheResource(RocksDBCachePtr cache);
+      static Cache * CreateCacheResource(std::shared_ptr<rocksdb::Cache> cache);
       static Cache * RetrieveCacheResource(ErlNifEnv * Env, const ERL_NIF_TERM & CacheTerm);
 
     private:
-      RocksDBCachePtr cache_;
+      std::shared_ptr<rocksdb::Cache> cache_;
   };
 
 }

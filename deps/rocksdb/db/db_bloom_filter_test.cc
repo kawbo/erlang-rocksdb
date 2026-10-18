@@ -137,11 +137,6 @@ class SliceTransformLimitedDomainGeneric : public SliceTransform {
     // prefix will be x????
     return src.size() >= 5;
   }
-
-  bool InRange(const Slice& dst) const override {
-    // prefix will be x????
-    return dst.size() == 5;
-  }
 };
 
 // KeyMayExist can lead to a few false positives, but not false negatives.
@@ -710,12 +705,20 @@ class AlwaysTrueBitsBuilder : public FilterBitsBuilder {
     count_ = 0;
     // Interpreted as "always true" filter (0 probes over 1 byte of
     // payload, 5 bytes metadata)
-    return Slice("\0\0\0\0\0\0", 6);
+    return Slice("\0\0\0\0\0\0", kAlwaysTrueFilterBytes);
   }
   using FilterBitsBuilder::Finish;
   size_t ApproximateNumEntries(size_t) override { return SIZE_MAX; }
+  size_t CalculateSpace(size_t /* num_entries */) override {
+    return kAlwaysTrueFilterBytes;
+  }
+  double EstimatedFpRate(size_t /* num_entries */,
+                         size_t /* bytes */) override {
+    return 1.0;
+  }
 
  private:
+  static constexpr size_t kAlwaysTrueFilterBytes = 6;
   size_t count_ = 0;
 };
 
@@ -914,14 +917,14 @@ INSTANTIATE_TEST_CASE_P(
     ::testing::Values(
         std::make_tuple(kAutoBloom,
                         FilterPartitioning::kCoupledPartitionedFilter,
-                        kLatestFormatVersion),
+                        kLatestBbtFormatVersion),
         std::make_tuple(kAutoBloom,
                         FilterPartitioning::kDecoupledPartitionedFilter,
-                        kLatestFormatVersion),
+                        kLatestBbtFormatVersion),
         std::make_tuple(kAutoBloom, FilterPartitioning::kUnpartitionedFilter,
-                        kLatestFormatVersion),
+                        kLatestBbtFormatVersion),
         std::make_tuple(kAutoRibbon, FilterPartitioning::kUnpartitionedFilter,
-                        kLatestFormatVersion)));
+                        kLatestBbtFormatVersion)));
 #endif  // !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 
 TEST_F(DBBloomFilterTest, BloomFilterRate) {
@@ -2069,11 +2072,6 @@ class SliceTransformLimitedDomain : public SliceTransform {
     // prefix will be x????
     return src.size() >= 5 && src[0] == 'x';
   }
-
-  bool InRange(const Slice& dst) const override {
-    // prefix will be x????
-    return dst.size() == 5 && dst[0] == 'x';
-  }
 };
 
 TEST_F(DBBloomFilterTest, PrefixExtractorWithFilter1) {
@@ -2244,6 +2242,54 @@ TEST_F(DBBloomFilterTest, MemtableWholeKeyBloomFilterMultiGet) {
 
   db_->ReleaseSnapshot(snapshot);
 }
+
+TEST_F(DBBloomFilterTest, TestMemtableBloomAndWBM) {
+  Options options = CurrentOptions();
+  options.arena_block_size = 4096;
+  options.write_buffer_size = 4000000;
+  std::shared_ptr<Cache> cache = NewLRUCache(LRUCacheOptions(
+      options.write_buffer_size * 3 /* capacity */, 1 /* num_shard_bits */,
+      false /* strict_capacity_limit */, 0.0 /* high_pri_pool_ratio */,
+      nullptr /* memory_allocator */, kDefaultToAdaptiveMutex,
+      kDontChargeCacheMetadata));
+
+  options.write_buffer_manager.reset(
+      new WriteBufferManager(options.write_buffer_size, cache));
+  Reopen(options);
+  ASSERT_OK(Put("foo", "bar"));
+
+  const auto kDummyEntrySize =
+      CacheReservationManagerImpl<CacheEntryRole::kMisc>::GetDummyEntrySize();
+
+  // Just the start of a memtable, no Bloom
+  ASSERT_GE(cache->GetUsage(), options.arena_block_size);
+  ASSERT_LE(cache->GetUsage(), kDummyEntrySize);
+
+  // Now enable memtable bloom filter
+  const double kRatio = 0.25;
+  options.memtable_prefix_bloom_size_ratio = kRatio;
+  options.memtable_whole_key_filtering = true;
+  Reopen(options);
+  ASSERT_OK(Put("foo2", "bar2"));
+
+  // Expecting a memtable Bloom of ratio times write_buffer_size, memory tracked
+  auto bloom_size = static_cast<size_t>(kRatio * options.write_buffer_size);
+  ASSERT_GE(cache->GetUsage(), bloom_size);
+  ASSERT_LE(cache->GetUsage(), bloom_size + 2U * kDummyEntrySize);
+
+  // Now get another memtable and test
+  // Pin this memtable with an iterator
+  std::unique_ptr<Iterator> iter{db_->NewIterator({})};
+  iter->Seek("foo2");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("foo2", "bar2"));
+
+  // Expecting twice as much
+  ASSERT_GE(cache->GetUsage(), 2U * bloom_size);
+  ASSERT_LE(cache->GetUsage(), 2U * bloom_size + 2U * kDummyEntrySize);
+}
+
 namespace {
 std::pair<uint64_t, uint64_t> GetBloomStat(const Options& options, bool sst) {
   if (sst) {
@@ -4089,7 +4135,7 @@ TEST_F(DBBloomFilterTest, SstQueryFilter) {
 
   using Keys = std::vector<std::string>;
   auto RangeQuery =
-      [factory, db = db_](
+      [factory, db = db_.get()](
           std::string lb, std::string ub,
           std::shared_ptr<SstQueryFilterConfigsManager::Factory> alt_factory =
               nullptr) {

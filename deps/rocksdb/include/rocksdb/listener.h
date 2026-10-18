@@ -183,6 +183,8 @@ enum class FlushReason : int {
   kWalFull = 0xd,
   // SwitchMemtable will not be called for this flush reason.
   kCatchUpAfterErrorRecovery = 0xe,
+
+  // When adding flush reason, make sure to also add it to FlushReason in Java.
 };
 
 const char* GetFlushReasonString(FlushReason flush_reason);
@@ -199,6 +201,7 @@ enum class BackgroundErrorReason {
   kManifestWrite,
   kFlushNoWAL,
   kManifestWriteNoWAL,
+  kAsyncFileOpen,
 };
 
 struct WriteStallInfo {
@@ -210,7 +213,6 @@ struct WriteStallInfo {
     WriteStallCondition prev;
   } condition;
 };
-
 
 struct FileDeletionInfo {
   FileDeletionInfo() = default;
@@ -438,6 +440,9 @@ struct CompactionJobInfo {
   // the job id, which is unique in the same thread.
   int job_id;
 
+  // the number of L0 files in the CF right before and after the compaction
+  int num_l0_files;
+
   // the smallest input level of the compaction.
   int base_input_level;
   // the output level of the compaction.
@@ -484,6 +489,9 @@ struct CompactionJobInfo {
   // Information about blob files deleted during compaction in Integrated
   // BlobDB.
   std::vector<BlobFileGarbageInfo> blob_file_garbage_infos;
+
+  // Whether this compaction was aborted via AbortAllCompactions()
+  bool aborted = false;
 };
 
 struct MemTableInfo {
@@ -544,6 +552,34 @@ struct IOErrorInfo {
   std::string file_path;
   size_t length;
   uint64_t offset;
+};
+
+// EXPERIMENTAL — under active development, fields may change.
+// Point-in-time snapshot of background job pressure for one DB: how busy
+// compaction and flush are, and how close the DB is to write-stalling.
+struct BackgroundJobPressure {
+  // Compaction scheduling (LOW + BOTTOM priority combined)
+  int compaction_scheduled = 0;
+  int compaction_running = 0;
+
+  // Per-priority compaction breakdown
+  int compaction_low_scheduled = 0;
+  int compaction_low_running = 0;
+  int compaction_bottom_scheduled = 0;
+  int compaction_bottom_running = 0;
+
+  // Flush scheduling
+  int flush_scheduled = 0;
+  int flush_running = 0;
+
+  // How close the DB is to a write stall, as a percentage (0 = healthy,
+  // 100 = at stall threshold). Can exceed 100 when already stalling.
+  // Max across all column families based on write-stall triggers.
+  int write_stall_proximity_pct = 0;
+  // Whether RocksDB has activated compaction speedup due to write pressure
+  bool compaction_speedup_active = false;
+
+  bool operator==(const BackgroundJobPressure&) const = default;
 };
 
 // EventListener class contains a set of callback functions that will
@@ -862,8 +898,18 @@ class EventListener : public Customizable {
   // happens. ShouldBeNotifiedOnFileIO should be set to true to get a callback.
   virtual void OnIOError(const IOErrorInfo& /*info*/) {}
 
+  // EXPERIMENTAL
+  // Called after a flush or compaction background job completes, providing a
+  // snapshot of current background job scheduling pressure and write-stall
+  // proximity. Fires on the background thread that completed the job, without
+  // holding db_mutex_. This callback fires on every completion, even if
+  // pressure values have not changed from the previous call.
+  // Implementations should not run for an extended period of time before
+  // returning, as this blocks RocksDB background work.
+  virtual void OnBackgroundJobPressureChanged(
+      DB* /*db*/, const BackgroundJobPressure& /*pressure*/) {}
+
   ~EventListener() override {}
 };
-
 
 }  // namespace ROCKSDB_NAMESPACE

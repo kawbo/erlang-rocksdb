@@ -1,6 +1,6 @@
 // -------------------------------------------------------------------
 // Copyright (c) 2011-2013 Basho Technologies, Inc. All Rights Reserved.
-// Copyright (c) 2016-2022 Benoit Chesneau. All Rights Reserved.
+// Copyright (c) 2016-2026 Benoit Chesneau. All Rights Reserved.
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -45,6 +45,7 @@ namespace erocksdb {
 ERL_NIF_TERM error_einval(ErlNifEnv* env);
 ERL_NIF_TERM error_tuple(ErlNifEnv* env, ERL_NIF_TERM error, rocksdb::Status& status);
 ERL_NIF_TERM status_to_term(ErlNifEnv* env, rocksdb::Status& status);
+ERL_NIF_TERM error_tuple(ErlNifEnv* env, ERL_NIF_TERM error, const char* msg);
 ERL_NIF_TERM slice_to_binary(ErlNifEnv* env, rocksdb::Slice s);
 
 int binary_to_slice(ErlNifEnv* env, ERL_NIF_TERM val, rocksdb::Slice *slice);

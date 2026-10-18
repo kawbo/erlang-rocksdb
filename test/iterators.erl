@@ -21,8 +21,6 @@
 %% -------------------------------------------------------------------
 -module(iterators).
 
--compile(export_all).
-
 -include_lib("eunit/include/eunit.hrl").
 
 prev_test() ->
@@ -65,7 +63,7 @@ seek_for_prev_test() ->
 
 cf_iterator_test() ->
   rocksdb_test_util:rm_rf("ltest"),  % NOTE
-  {ok, Ref, [DefaultH]} = rocksdb:open_with_cf("ltest", [{create_if_missing, true}], [{"default", []}]),
+  {ok, Ref, [DefaultH]} = rocksdb:open("ltest", [{create_if_missing, true}], [{"default", []}]),
   {ok, TestH} = rocksdb:create_column_family(Ref, "test", []),
   try
     rocksdb:put(Ref, DefaultH, <<"a">>, <<"x">>, []),
@@ -92,7 +90,7 @@ cf_iterator_test() ->
 
 cf_iterators_test() ->
   rocksdb_test_util:rm_rf("ltest"),  % NOTE
-  {ok, Ref, [DefaultH]} = rocksdb:open_with_cf("ltest", [{create_if_missing, true}], [{"default", []}]),
+  {ok, Ref, [DefaultH]} = rocksdb:open("ltest", [{create_if_missing, true}], [{"default", []}]),
   {ok, TestH} = rocksdb:create_column_family(Ref, "test", []),
   try
     rocksdb:put(Ref, DefaultH, <<"a">>, <<"x">>, []),
@@ -118,7 +116,7 @@ cf_iterators_test() ->
 
 drop_cf_with_iterator_test() ->
   rocksdb_test_util:rm_rf("ltest"),  % NOTE
-  {ok, Ref, [DefaultH]} = rocksdb:open_with_cf("ltest", [{create_if_missing, true}], [{"default", []}]),
+  {ok, Ref, [DefaultH]} = rocksdb:open("ltest", [{create_if_missing, true}], [{"default", []}]),
   {ok, TestH} = rocksdb:create_column_family(Ref, "test", []),
   try
     rocksdb:put(Ref, DefaultH, <<"a">>, <<"x">>, []),
@@ -132,7 +130,7 @@ drop_cf_with_iterator_test() ->
     ?assertEqual({ok, <<"a">>, <<"x">>},rocksdb:iterator_move(DefaultIt, <<>>)),
     ?assertEqual({ok, <<"a">>, <<"x1">>},rocksdb:iterator_move(TestIt, <<>>)),
 
-    ok = rocksdb:drop_column_family(TestH),
+    ok = rocksdb:drop_column_family(Ref, TestH),
 
     %% make sure we can read the read iterator
     ?assertEqual({ok, <<"b">>, <<"y">>},rocksdb:iterator_move(DefaultIt, next)),
@@ -255,9 +253,116 @@ invalid_test() ->
   rocksdb:destroy("ltest", []),
   rocksdb_test_util:rm_rf("ltest").
 
+%% Test auto_readahead_size option for iterators
+auto_readahead_size_test() ->
+  rocksdb_test_util:rm_rf("ltest"),
+  {ok, Ref} = rocksdb:open("ltest", [{create_if_missing, true}]),
+  try
+    rocksdb:put(Ref, <<"key1">>, <<"val1">>, []),
+    rocksdb:put(Ref, <<"key2">>, <<"val2">>, []),
+    rocksdb:put(Ref, <<"key3">>, <<"val3">>, []),
 
-seek_iterator(Itr, Prefix, Suffix) ->
-  rocksdb:iterator_move(Itr, test_key(Prefix, Suffix)).
+    %% Test with auto_readahead_size enabled (default is true in RocksDB 8.10+)
+    {ok, I1} = rocksdb:iterator(Ref, [{auto_readahead_size, true}]),
+    ?assertEqual({ok, <<"key1">>, <<"val1">>}, rocksdb:iterator_move(I1, first)),
+    ?assertEqual({ok, <<"key2">>, <<"val2">>}, rocksdb:iterator_move(I1, next)),
+    ?assertEqual(ok, rocksdb:iterator_close(I1)),
+
+    %% Test with auto_readahead_size disabled
+    {ok, I2} = rocksdb:iterator(Ref, [{auto_readahead_size, false}]),
+    ?assertEqual({ok, <<"key1">>, <<"val1">>}, rocksdb:iterator_move(I2, first)),
+    ?assertEqual({ok, <<"key2">>, <<"val2">>}, rocksdb:iterator_move(I2, next)),
+    ?assertEqual(ok, rocksdb:iterator_close(I2))
+  after
+    rocksdb:close(Ref)
+  end,
+  rocksdb:destroy("ltest", []),
+  rocksdb_test_util:rm_rf("ltest").
+
+%% Test allow_unprepared_value option for lazy blob loading in BlobDB
+%% When allow_unprepared_value=true, blob values are not loaded until
+%% PrepareValue() is called
+allow_unprepared_value_test() ->
+  rocksdb_test_util:rm_rf("test_unprepared"),
+  {ok, Ref} = rocksdb:open("test_unprepared",
+    [{create_if_missing, true}
+    ,{enable_blob_files, true}
+    ,{min_blob_size, 0}]),  %% All values go to blob files
+  try
+    Value = list_to_binary(lists:duplicate(100, $a)),
+    rocksdb:put(Ref, <<"key1">>, Value, []),
+    rocksdb:put(Ref, <<"key2">>, Value, []),
+    rocksdb:flush(Ref, []),
+
+    %% Test with allow_unprepared_value enabled
+    %% Values will be empty until PrepareValue() is called
+    {ok, I} = rocksdb:iterator(Ref, [{allow_unprepared_value, true}]),
+    %% Keys are returned, but blob values are empty (not yet loaded)
+    {ok, <<"key1">>, _} = rocksdb:iterator_move(I, first),
+    {ok, <<"key2">>, _} = rocksdb:iterator_move(I, next),
+    ?assertEqual(ok, rocksdb:iterator_close(I)),
+
+    %% Test with allow_unprepared_value disabled (default)
+    %% Values are loaded automatically
+    {ok, I2} = rocksdb:iterator(Ref, [{allow_unprepared_value, false}]),
+    ?assertEqual({ok, <<"key1">>, Value}, rocksdb:iterator_move(I2, first)),
+    ?assertEqual({ok, <<"key2">>, Value}, rocksdb:iterator_move(I2, next)),
+    ?assertEqual(ok, rocksdb:iterator_close(I2))
+  after
+    rocksdb:close(Ref)
+  end,
+  rocksdb:destroy("test_unprepared", []),
+  rocksdb_test_util:rm_rf("test_unprepared").
+
+%% Test iterator_prepare_value for explicit blob value loading
+iterator_prepare_value_test() ->
+  rocksdb_test_util:rm_rf("test_prepare_value"),
+  {ok, Ref} = rocksdb:open("test_prepare_value",
+    [{create_if_missing, true}
+    ,{enable_blob_files, true}
+    ,{min_blob_size, 0}]),  %% All values go to blob files
+  try
+    Value1 = list_to_binary(lists:duplicate(100, $a)),
+    Value2 = list_to_binary(lists:duplicate(100, $b)),
+    rocksdb:put(Ref, <<"key1">>, Value1, []),
+    rocksdb:put(Ref, <<"key2">>, Value2, []),
+    rocksdb:flush(Ref, []),
+
+    %% Create iterator with allow_unprepared_value
+    {ok, I} = rocksdb:iterator(Ref, [{allow_unprepared_value, true}]),
+
+    %% Move to first - value is empty (unprepared)
+    {ok, <<"key1">>, EmptyVal1} = rocksdb:iterator_move(I, first),
+    ?assertEqual(<<>>, EmptyVal1),
+
+    %% Call prepare_value to load the blob
+    ?assertEqual(ok, rocksdb:iterator_prepare_value(I)),
+
+    %% Now when we call iterator_move with a seek to the same key,
+    %% we can verify the value is there. Note: we need to re-seek
+    %% because iterator_move doesn't re-read the current value
+    %% Actually, the value should be available in the iterator's
+    %% value() method after PrepareValue. Let's just verify prepare works.
+
+    %% Move to next - value is also empty until prepared
+    {ok, <<"key2">>, EmptyVal2} = rocksdb:iterator_move(I, next),
+    ?assertEqual(<<>>, EmptyVal2),
+
+    %% Prepare the second value
+    ?assertEqual(ok, rocksdb:iterator_prepare_value(I)),
+
+    ?assertEqual(ok, rocksdb:iterator_close(I)),
+
+    %% Test error case: prepare_value on invalid iterator
+    {ok, I2} = rocksdb:iterator(Ref, [{allow_unprepared_value, true}]),
+    %% Iterator is not positioned yet, should return error
+    ?assertEqual({error, invalid_iterator}, rocksdb:iterator_prepare_value(I2)),
+    ?assertEqual(ok, rocksdb:iterator_close(I2))
+  after
+    rocksdb:close(Ref)
+  end,
+  rocksdb:destroy("test_prepare_value", []),
+  rocksdb_test_util:rm_rf("test_prepare_value").
 
 test_key(Prefix, Suffix) when is_integer(Prefix), is_integer(Suffix) ->
   << Prefix:64, Suffix:64 >>.

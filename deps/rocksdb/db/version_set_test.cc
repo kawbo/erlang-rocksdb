@@ -26,6 +26,7 @@
 #include "test_util/mock_time_env.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/defer.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -55,7 +56,8 @@ class GenerateLevelFilesBriefTest : public testing::Test {
         kInvalidBlobFileNumber, kUnknownOldestAncesterTime,
         kUnknownFileCreationTime, kUnknownEpochNumber, kUnknownFileChecksum,
         kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
-        /* user_defined_timestamps_persisted */ true);
+        /* user_defined_timestamps_persisted */ true, /* min timestamp */ "",
+        /* max timestamp */ "");
     files_.push_back(f);
   }
 
@@ -171,7 +173,8 @@ class VersionStorageInfoTestBase : public testing::Test {
         kUnknownOldestAncesterTime, kUnknownFileCreationTime,
         kUnknownEpochNumber, kUnknownFileChecksum, kUnknownFileChecksumFuncName,
         kNullUniqueId64x2, compensated_range_deletion_size, 0,
-        /* user_defined_timestamps_persisted */ true);
+        /* user_defined_timestamps_persisted */ true, /* min timestamp */ "",
+        /* max timestamp */ "");
     vstorage_.AddFile(level, f);
   }
 
@@ -390,7 +393,8 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0_1) {
   ASSERT_EQ(51450U, vstorage_.MaxBytesForLevel(3));
   ASSERT_EQ(257250U, vstorage_.MaxBytesForLevel(4));
 
-  vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_);
+  vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_,
+                                   /*full_history_ts_low=*/"");
   // Only L0 hits compaction.
   ASSERT_EQ(vstorage_.CompactionScoreLevel(0), 0);
 }
@@ -420,7 +424,8 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0_2) {
   ASSERT_EQ(51450U, vstorage_.MaxBytesForLevel(3));
   ASSERT_EQ(257250U, vstorage_.MaxBytesForLevel(4));
 
-  vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_);
+  vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_,
+                                   /*full_history_ts_low=*/"");
   // Although L2 and l3 have higher unadjusted compaction score, considering
   // a relatively large L0 being compacted down soon, L4 is picked up for
   // compaction.
@@ -452,7 +457,8 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0_3) {
   ASSERT_EQ(2, vstorage_.base_level());
   ASSERT_EQ(20000U, vstorage_.MaxBytesForLevel(2));
 
-  vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_);
+  vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_,
+                                   /*full_history_ts_low=*/"");
   // Although L2 has higher unadjusted compaction score, considering
   // a relatively large L0 being compacted down soon, L3 is picked up for
   // compaction.
@@ -482,7 +488,8 @@ TEST_F(VersionStorageInfoTest, DrainUnnecessaryLevel) {
   ASSERT_EQ(1, vstorage_.base_level());
   ASSERT_EQ(1000, vstorage_.MaxBytesForLevel(1));
   ASSERT_EQ(10100, vstorage_.MaxBytesForLevel(3));
-  vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_);
+  vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_,
+                                   /*full_history_ts_low=*/"");
 
   // Tests that levels 1 and 3 are eligible for compaction.
   // Levels 1 and 3 are much smaller than target size,
@@ -1158,12 +1165,12 @@ class VersionSetTestBase {
       : env_(nullptr),
         dbname_(test::PerThreadDBPath(name)),
         options_(),
-        db_options_(options_),
+        imm_db_options_(options_),
         cf_options_(options_),
-        immutable_options_(db_options_, cf_options_),
+        immutable_options_(imm_db_options_, cf_options_),
         mutable_cf_options_(cf_options_),
         table_cache_(NewLRUCache(50000, 16)),
-        write_buffer_manager_(db_options_.db_write_buffer_size),
+        write_buffer_manager_(imm_db_options_.db_write_buffer_size),
         shutting_down_(false),
         table_factory_(std::make_shared<mock::MockTableFactory>()) {
     EXPECT_OK(test::CreateEnvFromSystem(ConfigOptions(), &env_, &env_guard_));
@@ -1177,8 +1184,8 @@ class VersionSetTestBase {
     EXPECT_OK(fs_->CreateDirIfMissing(dbname_, IOOptions(), nullptr));
 
     options_.env = env_;
-    db_options_.env = env_;
-    db_options_.fs = fs_;
+    imm_db_options_.env = env_;
+    imm_db_options_.fs = fs_;
     immutable_options_.env = env_;
     immutable_options_.fs = fs_;
     immutable_options_.clock = env_->GetSystemClock().get();
@@ -1187,16 +1194,17 @@ class VersionSetTestBase {
     mutable_cf_options_.table_factory = table_factory_;
 
     versions_.reset(new VersionSet(
-        dbname_, &db_options_, env_options_, table_cache_.get(),
-        &write_buffer_manager_, &write_controller_,
+        dbname_, &imm_db_options_, mutable_db_options_, env_options_,
+        table_cache_.get(), &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
         /*error_handler=*/nullptr, /*read_only=*/false));
     reactive_versions_ = std::make_shared<ReactiveVersionSet>(
-        dbname_, &db_options_, env_options_, table_cache_.get(),
-        &write_buffer_manager_, &write_controller_, nullptr);
-    db_options_.db_paths.emplace_back(dbname_,
-                                      std::numeric_limits<uint64_t>::max());
+        dbname_, &imm_db_options_, mutable_db_options_, env_options_,
+        table_cache_.get(), &write_buffer_manager_, &write_controller_,
+        nullptr);
+    imm_db_options_.db_paths.emplace_back(dbname_,
+                                          std::numeric_limits<uint64_t>::max());
   }
 
   virtual ~VersionSetTestBase() {
@@ -1219,12 +1227,13 @@ class VersionSetTestBase {
     ASSERT_OK(
         SetIdentityFile(WriteOptions(), env_, dbname_, Temperature::kUnknown));
     VersionEdit new_db;
-    if (db_options_.write_dbid_to_manifest) {
-      DBOptions tmp_db_options;
-      tmp_db_options.env = env_;
-      std::unique_ptr<DBImpl> impl(new DBImpl(tmp_db_options, dbname_));
+    if (imm_db_options_.write_dbid_to_manifest) {
       std::string db_id;
-      ASSERT_OK(impl->GetDbIdentityFromIdentityFile(IOOptions(), &db_id));
+      ASSERT_OK(ReadFileToString(env_, IdentityFileName(dbname_), &db_id));
+      // Strip trailing newline if present (old GenerateUniqueId format)
+      if (!db_id.empty() && db_id.back() == '\n') {
+        db_id.pop_back();
+      }
       new_db.SetDBId(db_id);
     }
     new_db.SetLogNumber(0);
@@ -1344,7 +1353,8 @@ class VersionSetTestBase {
           Temperature::kUnknown, info.oldest_blob_file_number, 0, 0,
           info.epoch_number, kUnknownFileChecksum, kUnknownFileChecksumFuncName,
           kNullUniqueId64x2, 0, 0,
-          /* user_defined_timestamps_persisted */ true);
+          /* user_defined_timestamps_persisted */ true, /* min timestamp */ "",
+          /* max timestamp */ "");
       if (info.file_missing) {
         ASSERT_OK(fs_->DeleteFile(fname, IOOptions(), nullptr));
       }
@@ -1380,8 +1390,8 @@ class VersionSetTestBase {
 
   void ReopenDB() {
     versions_.reset(new VersionSet(
-        dbname_, &db_options_, env_options_, table_cache_.get(),
-        &write_buffer_manager_, &write_controller_,
+        dbname_, &imm_db_options_, mutable_db_options_, env_options_,
+        table_cache_.get(), &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
         /*error_handler=*/nullptr, /*read_only=*/false));
@@ -1408,8 +1418,8 @@ class VersionSetTestBase {
   Status LogAndApplyToDefaultCF(VersionEdit& edit) {
     mutex_.Lock();
     Status s = versions_->LogAndApply(
-        versions_->GetColumnFamilySet()->GetDefault(), mutable_cf_options_,
-        read_options_, write_options_, &edit, &mutex_, nullptr);
+        versions_->GetColumnFamilySet()->GetDefault(), read_options_,
+        write_options_, &edit, &mutex_, nullptr);
     mutex_.Unlock();
     return s;
   }
@@ -1422,8 +1432,8 @@ class VersionSetTestBase {
     }
     mutex_.Lock();
     Status s = versions_->LogAndApply(
-        versions_->GetColumnFamilySet()->GetDefault(), mutable_cf_options_,
-        read_options_, write_options_, vedits, &mutex_, nullptr);
+        versions_->GetColumnFamilySet()->GetDefault(), read_options_,
+        write_options_, vedits, &mutex_, nullptr);
     mutex_.Unlock();
     return s;
   }
@@ -1434,9 +1444,8 @@ class VersionSetTestBase {
     mutex_.Lock();
     VersionEdit dummy;
     ASSERT_OK(versions_->LogAndApply(
-        versions_->GetColumnFamilySet()->GetDefault(), mutable_cf_options_,
-        read_options_, write_options_, &dummy, &mutex_, db_directory,
-        new_descriptor_log));
+        versions_->GetColumnFamilySet()->GetDefault(), read_options_,
+        write_options_, &dummy, &mutex_, db_directory, new_descriptor_log));
     mutex_.Unlock();
   }
 
@@ -1452,8 +1461,7 @@ class VersionSetTestBase {
         cf_options.persist_user_defined_timestamps);
     Status s;
     mutex_.Lock();
-    s = versions_->LogAndApply(/*column_family_data=*/nullptr,
-                               MutableCFOptions(cf_options), read_options_,
+    s = versions_->LogAndApply(/*column_family_data=*/nullptr, read_options_,
                                write_options_, &new_cf, &mutex_,
                                /*db_directory=*/nullptr,
                                /*new_descriptor_log=*/false, &cf_options);
@@ -1472,7 +1480,8 @@ class VersionSetTestBase {
   const std::string dbname_;
   EnvOptions env_options_;
   Options options_;
-  ImmutableDBOptions db_options_;
+  ImmutableDBOptions imm_db_options_;
+  MutableDBOptions mutable_db_options_;
   ColumnFamilyOptions cf_options_;
   ImmutableOptions immutable_options_;
   MutableCFOptions mutable_cf_options_;
@@ -1510,11 +1519,9 @@ TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
     edits.emplace_back(VersionEdit());
   }
   autovector<ColumnFamilyData*> cfds;
-  autovector<const MutableCFOptions*> all_mutable_cf_options;
   autovector<autovector<VersionEdit*>> edit_lists;
   for (int i = 0; i != kGroupSize; ++i) {
     cfds.emplace_back(versions_->GetColumnFamilySet()->GetDefault());
-    all_mutable_cf_options.emplace_back(&mutable_cf_options_);
     autovector<VersionEdit*> edit_list;
     edit_list.emplace_back(&edits[i]);
     edit_lists.emplace_back(edit_list);
@@ -1531,9 +1538,8 @@ TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
       });
   SyncPoint::GetInstance()->EnableProcessing();
   mutex_.Lock();
-  Status s =
-      versions_->LogAndApply(cfds, all_mutable_cf_options, read_options,
-                             write_options, edit_lists, &mutex_, nullptr);
+  Status s = versions_->LogAndApply(cfds, read_options, write_options,
+                                    edit_lists, &mutex_, nullptr);
   mutex_.Unlock();
   EXPECT_OK(s);
   EXPECT_EQ(kGroupSize - 1, count);
@@ -1734,8 +1740,8 @@ TEST_F(VersionSetTest, ObsoleteBlobFile) {
 
   mutex_.Lock();
   Status s = versions_->LogAndApply(
-      versions_->GetColumnFamilySet()->GetDefault(), mutable_cf_options_,
-      read_options_, write_options_, &edit, &mutex_, nullptr);
+      versions_->GetColumnFamilySet()->GetDefault(), read_options_,
+      write_options_, &edit, &mutex_, nullptr);
   mutex_.Unlock();
 
   ASSERT_OK(s);
@@ -1906,11 +1912,11 @@ TEST_F(VersionSetTest, WalAddition) {
   // Recover a new VersionSet.
   {
     std::unique_ptr<VersionSet> new_versions(new VersionSet(
-        dbname_, &db_options_, env_options_, table_cache_.get(),
-        &write_buffer_manager_, &write_controller_,
+        dbname_, &imm_db_options_, mutable_db_options_, env_options_,
+        table_cache_.get(), &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     ASSERT_OK(new_versions->Recover(column_families_, /*read_only=*/false));
     const auto& wals = new_versions->GetWalSet().GetWals();
     ASSERT_EQ(wals.size(), 1);
@@ -1974,11 +1980,11 @@ TEST_F(VersionSetTest, WalCloseWithoutSync) {
   // Recover a new VersionSet.
   {
     std::unique_ptr<VersionSet> new_versions(new VersionSet(
-        dbname_, &db_options_, env_options_, table_cache_.get(),
-        &write_buffer_manager_, &write_controller_,
+        dbname_, &imm_db_options_, mutable_db_options_, env_options_,
+        table_cache_.get(), &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     ASSERT_OK(new_versions->Recover(column_families_, false));
     const auto& wals = new_versions->GetWalSet().GetWals();
     ASSERT_EQ(wals.size(), 2);
@@ -2028,11 +2034,11 @@ TEST_F(VersionSetTest, WalDeletion) {
   // Recover a new VersionSet, only the non-closed WAL should show up.
   {
     std::unique_ptr<VersionSet> new_versions(new VersionSet(
-        dbname_, &db_options_, env_options_, table_cache_.get(),
-        &write_buffer_manager_, &write_controller_,
+        dbname_, &imm_db_options_, mutable_db_options_, env_options_,
+        table_cache_.get(), &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     ASSERT_OK(new_versions->Recover(column_families_, false));
     const auto& wals = new_versions->GetWalSet().GetWals();
     ASSERT_EQ(wals.size(), 1);
@@ -2067,11 +2073,11 @@ TEST_F(VersionSetTest, WalDeletion) {
   // Recover from the new MANIFEST, only the non-closed WAL should show up.
   {
     std::unique_ptr<VersionSet> new_versions(new VersionSet(
-        dbname_, &db_options_, env_options_, table_cache_.get(),
-        &write_buffer_manager_, &write_controller_,
+        dbname_, &imm_db_options_, mutable_db_options_, env_options_,
+        table_cache_.get(), &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     ASSERT_OK(new_versions->Recover(column_families_, false));
     const auto& wals = new_versions->GetWalSet().GetWals();
     ASSERT_EQ(wals.size(), 1);
@@ -2188,11 +2194,11 @@ TEST_F(VersionSetTest, DeleteWalsBeforeNonExistingWalNumber) {
   // Recover a new VersionSet, WAL0 is deleted, WAL1 is not.
   {
     std::unique_ptr<VersionSet> new_versions(new VersionSet(
-        dbname_, &db_options_, env_options_, table_cache_.get(),
-        &write_buffer_manager_, &write_controller_,
+        dbname_, &imm_db_options_, mutable_db_options_, env_options_,
+        table_cache_.get(), &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     ASSERT_OK(new_versions->Recover(column_families_, false));
     const auto& wals = new_versions->GetWalSet().GetWals();
     ASSERT_EQ(wals.size(), 1);
@@ -2225,11 +2231,11 @@ TEST_F(VersionSetTest, DeleteAllWals) {
   // Recover a new VersionSet, all WALs are deleted.
   {
     std::unique_ptr<VersionSet> new_versions(new VersionSet(
-        dbname_, &db_options_, env_options_, table_cache_.get(),
-        &write_buffer_manager_, &write_controller_,
+        dbname_, &imm_db_options_, mutable_db_options_, env_options_,
+        table_cache_.get(), &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     ASSERT_OK(new_versions->Recover(column_families_, false));
     const auto& wals = new_versions->GetWalSet().GetWals();
     ASSERT_EQ(wals.size(), 0);
@@ -2268,11 +2274,11 @@ TEST_F(VersionSetTest, AtomicGroupWithWalEdits) {
   // kept.
   {
     std::unique_ptr<VersionSet> new_versions(new VersionSet(
-        dbname_, &db_options_, env_options_, table_cache_.get(),
-        &write_buffer_manager_, &write_controller_,
+        dbname_, &imm_db_options_, mutable_db_options_, env_options_,
+        table_cache_.get(), &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     std::string db_id;
     ASSERT_OK(
         new_versions->Recover(column_families_, /*read_only=*/false, &db_id));
@@ -2402,6 +2408,267 @@ TEST_F(VersionSetTest, ManifestTruncateAfterClose) {
   ReopenDB();
 }
 
+TEST_F(VersionSetTest, ManifestContentValidationOnCloseClean) {
+  // Enable content validation, perform normal operations, close.
+  // Verify no manifest rotation (file number unchanged).
+  NewDB();
+  mutable_db_options_.verify_manifest_content_on_close = true;
+  mutex_.Lock();
+  versions_->UpdatedMutableDbOptions(mutable_db_options_, &mutex_);
+  mutex_.Unlock();
+
+  VersionEdit edit;
+  ASSERT_OK(LogAndApplyToDefaultCF(edit));
+
+  std::string manifest_path_before;
+  GetManifestPath(&manifest_path_before);
+
+  bool content_validation_ran = false;
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::Close:BeforeContentValidation",
+      [&](void*) { content_validation_ran = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  CloseDB();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Verify content validation actually ran
+  ASSERT_TRUE(content_validation_ran);
+
+  // Manifest path should be unchanged (no rotation)
+  std::string manifest_path_after;
+  uint64_t manifest_file_number = 0;
+  ASSERT_OK(GetCurrentManifestPath(dbname_, fs_.get(), /*is_retry=*/false,
+                                   &manifest_path_after,
+                                   &manifest_file_number));
+  ASSERT_EQ(manifest_path_before, manifest_path_after);
+
+  ReopenDB();
+}
+
+TEST_F(VersionSetTest, ManifestContentValidationOnCloseCorruptRecord) {
+  // Enable content validation, corrupt the manifest after closing the writer,
+  // verify manifest rotation occurs and DB reopens cleanly.
+  NewDB();
+  mutable_db_options_.verify_manifest_content_on_close = true;
+  mutex_.Lock();
+  versions_->UpdatedMutableDbOptions(mutable_db_options_, &mutex_);
+  mutex_.Unlock();
+
+  VersionEdit edit;
+  ASSERT_OK(LogAndApplyToDefaultCF(edit));
+
+  std::string manifest_path_before;
+  GetManifestPath(&manifest_path_before);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::Close:BeforeContentValidation", [&](void*) {
+        // Corrupt bytes in the middle of the manifest
+        std::string manifest_path;
+        GetManifestPath(&manifest_path);
+        std::string content;
+        Status s = ReadFileToString(env_, manifest_path, &content);
+        EXPECT_OK(s);
+        if (!s.ok()) {
+          return;
+        }
+        ASSERT_GT(content.size(), 20u);
+        // Corrupt several bytes in the middle to break CRC
+        for (size_t i = content.size() / 2; i < content.size() / 2 + 8; i++) {
+          content[i] ^= 0xFF;
+        }
+        s = WriteStringToFile(env_, content, manifest_path);
+        EXPECT_OK(s);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  CloseDB();
+  SyncPoint::GetInstance()->DisableProcessing();
+
+  // Manifest should have been rotated (new file number)
+  std::string manifest_path_after;
+  uint64_t manifest_file_number = 0;
+  ASSERT_OK(GetCurrentManifestPath(dbname_, fs_.get(), /*is_retry=*/false,
+                                   &manifest_path_after,
+                                   &manifest_file_number));
+  ASSERT_NE(manifest_path_before, manifest_path_after);
+
+  // DB should reopen cleanly with the fresh manifest
+  ReopenDB();
+}
+
+TEST_F(VersionSetTest, ManifestContentValidationOnCloseDisabled) {
+  // Default (option disabled), corrupt manifest after writer close,
+  // verify no rotation occurred — corrupt manifest persists.
+  NewDB();
+  // verify_manifest_content_on_close defaults to false
+
+  VersionEdit edit;
+  ASSERT_OK(LogAndApplyToDefaultCF(edit));
+
+  std::string manifest_path_before;
+  GetManifestPath(&manifest_path_before);
+
+  bool content_validation_ran = false;
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::Close:BeforeContentValidation",
+      [&](void*) { content_validation_ran = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  CloseDB();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_FALSE(content_validation_ran);
+
+  // Manifest path should be unchanged (no rotation since validation is off)
+  std::string manifest_path_after;
+  uint64_t manifest_file_number = 0;
+  ASSERT_OK(GetCurrentManifestPath(dbname_, fs_.get(), /*is_retry=*/false,
+                                   &manifest_path_after,
+                                   &manifest_file_number));
+  ASSERT_EQ(manifest_path_before, manifest_path_after);
+}
+
+TEST_F(VersionSetTest, ManifestContentValidationOnCloseSizeCheckFails) {
+  // Truncate manifest so size check fails first.
+  // Verify recovery happens via size-check path. Content validation still
+  // runs afterward on the freshly rewritten manifest.
+  NewDB();
+  mutable_db_options_.verify_manifest_content_on_close = true;
+  mutex_.Lock();
+  versions_->UpdatedMutableDbOptions(mutable_db_options_, &mutex_);
+  mutex_.Unlock();
+
+  VersionEdit edit;
+  ASSERT_OK(LogAndApplyToDefaultCF(edit));
+
+  std::string manifest_path_before;
+  GetManifestPath(&manifest_path_before);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::Close:AfterClose", [&](void*) {
+        std::string manifest_path;
+        GetManifestPath(&manifest_path);
+        std::unique_ptr<WritableFile> manifest_file;
+        ASSERT_OK(env_->ReopenWritableFile(manifest_path, &manifest_file,
+                                           EnvOptions()));
+        ASSERT_OK(manifest_file->Truncate(0));
+        ASSERT_OK(manifest_file->Close());
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_NO_FATAL_FAILURE(CloseDB());
+  SyncPoint::GetInstance()->DisableProcessing();
+
+  // Size check should have triggered rotation
+  std::string manifest_path_after;
+  uint64_t manifest_file_number = 0;
+  ASSERT_OK(GetCurrentManifestPath(dbname_, fs_.get(), /*is_retry=*/false,
+                                   &manifest_path_after,
+                                   &manifest_file_number));
+  ASSERT_NE(manifest_path_before, manifest_path_after);
+
+  // DB should reopen cleanly
+  ReopenDB();
+}
+
+TEST_F(VersionSetTest, ManifestContentValidationOnCloseCorruptAfterRewrite) {
+  // Corrupt the manifest before content validation AND after the rewrite.
+  // The loop should detect corruption twice: once triggering a rewrite, and
+  // once reporting that the rewritten manifest is also corrupt.
+  NewDB();
+  mutable_db_options_.verify_manifest_content_on_close = true;
+  mutex_.Lock();
+  versions_->UpdatedMutableDbOptions(mutable_db_options_, &mutex_);
+  mutex_.Unlock();
+
+  VersionEdit edit;
+  ASSERT_OK(LogAndApplyToDefaultCF(edit));
+
+  int io_error_count = 0;
+  class IOErrorCountListener : public EventListener {
+   public:
+    int* count;
+    explicit IOErrorCountListener(int* c) : count(c) {}
+    void OnIOError(const IOErrorInfo& /*info*/) override { ++(*count); }
+  };
+  imm_db_options_.listeners.push_back(
+      std::make_shared<IOErrorCountListener>(&io_error_count));
+
+  auto corrupt_current_manifest = [&]() {
+    std::string manifest_path;
+    GetManifestPath(&manifest_path);
+    std::string content;
+    ASSERT_OK(ReadFileToString(env_, manifest_path, &content));
+    ASSERT_GT(content.size(), 20u);
+    for (size_t i = content.size() / 2; i < content.size() / 2 + 8; i++) {
+      content[i] ^= 0xFF;
+    }
+    ASSERT_OK(WriteStringToFile(env_, content, manifest_path));
+  };
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  // Corrupt before the first content check
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::Close:BeforeContentValidation",
+      [&](void*) { corrupt_current_manifest(); });
+  // Corrupt again after the rewrite completes
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:WriteManifestDone",
+      [&](void*) { corrupt_current_manifest(); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  mutex_.Lock();
+  Status close_s = versions_->Close(nullptr, &mutex_);
+  versions_.reset();
+  mutex_.Unlock();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Close should report the persistent corruption
+  ASSERT_TRUE(close_s.IsCorruption()) << close_s.ToString();
+
+  // OnIOError should have fired twice (once per corrupt detection)
+  ASSERT_EQ(io_error_count, 2);
+}
+
+TEST_F(VersionSetTest, ManifestContentValidationOnCloseOpenFails) {
+  // Delete the manifest before content validation so it can't be opened.
+  // Close() should surface the I/O error to the caller.
+  NewDB();
+  mutable_db_options_.verify_manifest_content_on_close = true;
+  mutex_.Lock();
+  versions_->UpdatedMutableDbOptions(mutable_db_options_, &mutex_);
+  mutex_.Unlock();
+
+  VersionEdit edit;
+  ASSERT_OK(LogAndApplyToDefaultCF(edit));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::Close:BeforeContentValidation", [&](void*) {
+        std::string manifest_path;
+        GetManifestPath(&manifest_path);
+        ASSERT_OK(env_->DeleteFile(manifest_path));
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  mutex_.Lock();
+  Status close_s = versions_->Close(nullptr, &mutex_);
+  versions_.reset();
+  mutex_.Unlock();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_TRUE(close_s.IsIOError()) << close_s.ToString();
+}
+
 TEST_F(VersionStorageInfoTest, AddRangeDeletionCompensatedFileSize) {
   // Tests that compensated range deletion size is added to compensated file
   // size.
@@ -2425,7 +2692,6 @@ class VersionSetWithTimestampTest : public VersionSetTest {
     options.comparator = test::BytewiseComparatorWithU64TsWrapper();
     cfd_ = CreateColumnFamily(kNewCfName, options);
     EXPECT_NE(nullptr, cfd_);
-    EXPECT_NE(nullptr, cfd_->GetLatestMutableCFOptions());
     column_families_.emplace_back(kNewCfName, options);
   }
 
@@ -2449,11 +2715,11 @@ class VersionSetWithTimestampTest : public VersionSetTest {
 
   void VerifyFullHistoryTsLow(uint64_t expected_ts_low) {
     std::unique_ptr<VersionSet> vset(new VersionSet(
-        dbname_, &db_options_, env_options_, table_cache_.get(),
-        &write_buffer_manager_, &write_controller_,
+        dbname_, &imm_db_options_, mutable_db_options_, env_options_,
+        table_cache_.get(), &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*unchanging=*/false));
     ASSERT_OK(vset->Recover(column_families_, /*read_only=*/false,
                             /*db_id=*/nullptr));
     for (auto* cfd : *(vset->GetColumnFamilySet())) {
@@ -2475,9 +2741,8 @@ class VersionSetWithTimestampTest : public VersionSetTest {
 
     Status s;
     mutex_.Lock();
-    s = versions_->LogAndApply(cfd_, *(cfd_->GetLatestMutableCFOptions()),
-                               read_options_, write_options_, edits_, &mutex_,
-                               nullptr);
+    s = versions_->LogAndApply(cfd_, read_options_, write_options_, edits_,
+                               &mutex_, nullptr);
     mutex_.Unlock();
     ASSERT_OK(s);
     VerifyFullHistoryTsLow(*std::max_element(ts_lbs.begin(), ts_lbs.end()));
@@ -3370,9 +3635,8 @@ TEST_P(VersionSetTestDropOneCF, HandleDroppedColumnFamilyInAtomicGroup) {
   cfd_to_drop->Ref();
   drop_cf_edit.SetColumnFamily(cfd_to_drop->GetID());
   mutex_.Lock();
-  Status s = versions_->LogAndApply(
-      cfd_to_drop, *cfd_to_drop->GetLatestMutableCFOptions(), read_options,
-      write_options, &drop_cf_edit, &mutex_, nullptr);
+  Status s = versions_->LogAndApply(cfd_to_drop, read_options, write_options,
+                                    &drop_cf_edit, &mutex_, nullptr);
   mutex_.Unlock();
   ASSERT_OK(s);
 
@@ -3380,7 +3644,6 @@ TEST_P(VersionSetTestDropOneCF, HandleDroppedColumnFamilyInAtomicGroup) {
   uint32_t remaining = kAtomicGroupSize;
   size_t i = 0;
   autovector<ColumnFamilyData*> cfds;
-  autovector<const MutableCFOptions*> mutable_cf_options_list;
   autovector<autovector<VersionEdit*>> edit_lists;
   for (const auto& cf_name : non_default_cf_names) {
     auto cfd = (cf_name != cf_to_drop_name)
@@ -3388,7 +3651,6 @@ TEST_P(VersionSetTestDropOneCF, HandleDroppedColumnFamilyInAtomicGroup) {
                    : cfd_to_drop;
     ASSERT_NE(nullptr, cfd);
     cfds.push_back(cfd);
-    mutable_cf_options_list.emplace_back(cfd->GetLatestMutableCFOptions());
     edits[i].SetColumnFamily(cfd->GetID());
     edits[i].SetLogNumber(0);
     edits[i].SetNextFile(2);
@@ -3421,8 +3683,8 @@ TEST_P(VersionSetTestDropOneCF, HandleDroppedColumnFamilyInAtomicGroup) {
       });
   SyncPoint::GetInstance()->EnableProcessing();
   mutex_.Lock();
-  s = versions_->LogAndApply(cfds, mutable_cf_options_list, read_options,
-                             write_options, edit_lists, &mutex_, nullptr);
+  s = versions_->LogAndApply(cfds, read_options, write_options, edit_lists,
+                             &mutex_, nullptr);
   mutex_.Unlock();
   ASSERT_OK(s);
   ASSERT_EQ(1, called);
@@ -3509,14 +3771,15 @@ class VersionSetTestEmptyDb
                        std::unique_ptr<log::Writer>* log_writer) override {
     assert(nullptr != log_writer);
     VersionEdit new_db;
-    if (db_options_.write_dbid_to_manifest) {
+    if (imm_db_options_.write_dbid_to_manifest) {
       ASSERT_OK(SetIdentityFile(WriteOptions(), env_, dbname_,
                                 Temperature::kUnknown));
-      DBOptions tmp_db_options;
-      tmp_db_options.env = env_;
-      std::unique_ptr<DBImpl> impl(new DBImpl(tmp_db_options, dbname_));
       std::string db_id;
-      ASSERT_OK(impl->GetDbIdentityFromIdentityFile(IOOptions(), &db_id));
+      ASSERT_OK(ReadFileToString(env_, IdentityFileName(dbname_), &db_id));
+      // Strip trailing newline if present (old GenerateUniqueId format)
+      if (!db_id.empty() && db_id.back() == '\n') {
+        db_id.pop_back();
+      }
       new_db.SetDBId(db_id);
     }
     const std::string manifest_path = DescriptorFileName(dbname_, 1);
@@ -3541,7 +3804,7 @@ class VersionSetTestEmptyDb
 const std::string VersionSetTestEmptyDb::kUnknownColumnFamilyName = "unknown";
 
 TEST_P(VersionSetTestEmptyDb, OpenFromIncompleteManifest0) {
-  db_options_.write_dbid_to_manifest = std::get<0>(GetParam());
+  imm_db_options_.write_dbid_to_manifest = std::get<0>(GetParam());
   PrepareManifest(nullptr, nullptr, &log_writer_);
   log_writer_.reset();
   CreateCurrentFile();
@@ -3573,7 +3836,7 @@ TEST_P(VersionSetTestEmptyDb, OpenFromIncompleteManifest0) {
 }
 
 TEST_P(VersionSetTestEmptyDb, OpenFromIncompleteManifest1) {
-  db_options_.write_dbid_to_manifest = std::get<0>(GetParam());
+  imm_db_options_.write_dbid_to_manifest = std::get<0>(GetParam());
   PrepareManifest(nullptr, nullptr, &log_writer_);
   // Only a subset of column families in the MANIFEST.
   VersionEdit new_cf1;
@@ -3614,7 +3877,7 @@ TEST_P(VersionSetTestEmptyDb, OpenFromIncompleteManifest1) {
 }
 
 TEST_P(VersionSetTestEmptyDb, OpenFromInCompleteManifest2) {
-  db_options_.write_dbid_to_manifest = std::get<0>(GetParam());
+  imm_db_options_.write_dbid_to_manifest = std::get<0>(GetParam());
   PrepareManifest(nullptr, nullptr, &log_writer_);
   // Write all column families but no log_number, next_file_number and
   // last_sequence.
@@ -3660,7 +3923,7 @@ TEST_P(VersionSetTestEmptyDb, OpenFromInCompleteManifest2) {
 }
 
 TEST_P(VersionSetTestEmptyDb, OpenManifestWithUnknownCF) {
-  db_options_.write_dbid_to_manifest = std::get<0>(GetParam());
+  imm_db_options_.write_dbid_to_manifest = std::get<0>(GetParam());
   PrepareManifest(nullptr, nullptr, &log_writer_);
   // Write all column families but no log_number, next_file_number and
   // last_sequence.
@@ -3717,7 +3980,7 @@ TEST_P(VersionSetTestEmptyDb, OpenManifestWithUnknownCF) {
 }
 
 TEST_P(VersionSetTestEmptyDb, OpenCompleteManifest) {
-  db_options_.write_dbid_to_manifest = std::get<0>(GetParam());
+  imm_db_options_.write_dbid_to_manifest = std::get<0>(GetParam());
   PrepareManifest(nullptr, nullptr, &log_writer_);
   // Write all column families but no log_number, next_file_number and
   // last_sequence.
@@ -3759,6 +4022,8 @@ TEST_P(VersionSetTestEmptyDb, OpenCompleteManifest) {
   }
   std::string db_id;
   bool has_missing_table_file = false;
+  SaveAndRestore<bool> override_unchanging(&versions_->TEST_unchanging(),
+                                           read_only);
   s = versions_->TryRecoverFromOneManifest(manifest_path, column_families,
                                            read_only, &db_id,
                                            &has_missing_table_file);
@@ -3835,12 +4100,13 @@ class VersionSetTestMissingFiles : public VersionSetTestBase,
     ASSERT_OK(s);
     log_writer->reset(new log::Writer(std::move(file_writer), 0, false));
     VersionEdit new_db;
-    if (db_options_.write_dbid_to_manifest) {
-      DBOptions tmp_db_options;
-      tmp_db_options.env = env_;
-      std::unique_ptr<DBImpl> impl(new DBImpl(tmp_db_options, dbname_));
+    if (imm_db_options_.write_dbid_to_manifest) {
       std::string db_id;
-      ASSERT_OK(impl->GetDbIdentityFromIdentityFile(IOOptions(), &db_id));
+      ASSERT_OK(ReadFileToString(env_, IdentityFileName(dbname_), &db_id));
+      // Strip trailing newline if present (old GenerateUniqueId format)
+      if (!db_id.empty() && db_id.back() == '\n') {
+        db_id.pop_back();
+      }
       new_db.SetDBId(db_id);
     }
     {
@@ -3945,7 +4211,8 @@ TEST_F(VersionSetTestMissingFiles, ManifestFarBehindSst) {
         largest_ikey, 0, 0, false, Temperature::kUnknown, 0, 0, 0,
         file_num /* epoch_number */, kUnknownFileChecksum,
         kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
-        /* user_defined_timestamps_persisted */ true);
+        /* user_defined_timestamps_persisted */ true, /* min timestamp */ "",
+        /* max timestamp */ "");
     added_files.emplace_back(0, meta);
   }
   WriteFileAdditionAndDeletionToManifest(
@@ -4006,7 +4273,8 @@ TEST_F(VersionSetTestMissingFiles, ManifestAheadofSst) {
         largest_ikey, 0, 0, false, Temperature::kUnknown, 0, 0, 0,
         file_num /* epoch_number */, kUnknownFileChecksum,
         kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
-        /* user_defined_timestamps_persisted */ true);
+        /* user_defined_timestamps_persisted */ true, /* min timestamp */ "",
+        /* max timestamp */ "");
     added_files.emplace_back(0, meta);
   }
   WriteFileAdditionAndDeletionToManifest(
@@ -4095,7 +4363,7 @@ TEST_F(VersionSetTestMissingFiles, NoFileMissing) {
 }
 
 TEST_F(VersionSetTestMissingFiles, MinLogNumberToKeep2PC) {
-  db_options_.allow_2pc = true;
+  imm_db_options_.allow_2pc = true;
   NewDB();
 
   SstInfo sst(100, kDefaultColumnFamilyName, "a", 0 /* level */,

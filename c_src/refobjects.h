@@ -1,5 +1,5 @@
 // Copyright (c) 2011-2013 Basho Technologies, Inc. All Rights Reserved.
-// Copyright (c) 2016-2022 Benoit Chesneau
+// Copyright (c) 2016-2026 Benoit Chesneau
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -185,6 +185,8 @@ class DbObject : public ErlRefObject
 {
 public:
     rocksdb::DB* m_Db;                             // NULL or rocksdb database object
+    bool m_IsPessimistic;                          //!< true if opened as PessimisticTransactionDB
+    bool m_IsTTL;                                  //!< true if opened as DBWithTTL
     std::mutex m_ItrMutex;                         //!< mutex protecting m_ItrList
     std::mutex m_SnapshotMutex;                    //!< mutex protecting m_SnapshotList
     std::mutex m_ColumnFamilyMutex;                //!< mutex protecting m_ColumnFamily
@@ -201,7 +203,7 @@ protected:
     static ErlNifResourceType* m_Db_RESOURCE;
 
 public:
-    DbObject(rocksdb::DB * DbPtr); // Open with default CF
+    DbObject(rocksdb::DB * DbPtr, bool IsPessimistic = false, bool IsTTL = false); // Open with default CF
 
     DbObject() = delete;                             // no default construct
     DbObject(const DbObject&) = delete;              // nocopy
@@ -238,7 +240,7 @@ public:
 
     static void CreateDbObjectType(ErlNifEnv * Env);
 
-    static DbObject * CreateDbObject(rocksdb::DB * Db);
+    static DbObject * CreateDbObject(rocksdb::DB * Db, bool IsPessimistic = false, bool IsTTL = false);
 
     static DbObject * RetrieveDbObject(ErlNifEnv * Env, const ERL_NIF_TERM & DbTerm);
 
@@ -326,6 +328,11 @@ public:
     rocksdb::Slice *upper_bound_slice;
     rocksdb::Slice *lower_bound_slice;
 
+    //!< erlang resources (column family, transaction) kept alive with
+    //!< enif_keep_resource so they cannot be garbage collected and freed
+    //!< while this iterator still references them. Released in ~ItrObject.
+    std::list<void *> m_KeptResources;
+
 protected:
     static ErlNifResourceType* m_Itr_RESOURCE;
 
@@ -352,6 +359,10 @@ public:
     void SetUpperBoundSlice(rocksdb::Slice*);
 
     void SetLowerBoundSlice(rocksdb::Slice*);
+
+    //!< Pin an erlang resource (e.g. column family, transaction) for this
+    //!< iterator's lifetime so GC cannot free it while the iterator uses it.
+    void KeepResource(void * Resource);
 };  // class ItrObject
 
 /**

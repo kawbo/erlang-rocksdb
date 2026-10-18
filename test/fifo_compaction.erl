@@ -1,4 +1,19 @@
-%% https://github.com/facebook/rocksdb/wiki/FIFO-compaction-style
+%M copyright (c) 2024-2025 Oleksii Semilietov
+%%
+%% 
+%% This file is provided to you under the Apache License,
+%% Version 2.0 (the "License"); you may not use this file
+%% except in compliance with the License.  You may obtain
+%% a copy of the License at
+%%
+%%   http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing,
+%% software distributed under the License is distributed on an
+%% "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+%% KIND, either express or implied.  See the License for the
+%% specific language governing permissions and limitations
+%% under the License.
 
 -module(fifo_compaction).
 -include_lib("eunit/include/eunit.hrl").
@@ -36,7 +51,6 @@ fifo_compaction_options_allow_compaction_settings_1_test() ->
         {compaction_style, fifo},
         {compaction_options_fifo, [
             {allow_compaction, true},
-            {age_for_warm, 10},
             {max_table_files_size, 20}
         ]}
     ]
@@ -60,7 +74,6 @@ fifo_compaction_options_allow_compaction_settings_2_test() ->
         {compaction_style, fifo},
         {compaction_options_fifo, [
             {allow_compaction, false},
-            {age_for_warm, 40},
             {max_table_files_size, 50}
         ]}
     ]
@@ -74,6 +87,30 @@ fifo_compaction_options_allow_compaction_settings_2_test() ->
   ok = rocksdb:close(Db),
   ?rm_rf(DbName).
 
+
+%% RocksDB 11.0: FIFO trimming based on combined SST + blob file sizes,
+%% plus capacity-derived intra-L0 compaction (use_kv_ratio_compaction, which
+%% requires max_data_files_size > 0).
+fifo_compaction_max_data_files_size_test() ->
+  DbName = "erocksdb.fifo.max_data_files_size",
+  ?rm_rf(DbName),
+  {ok, Db} = rocksdb:open(
+    DbName,
+    [
+        {create_if_missing, true},
+        {compaction_style, fifo},
+        {compaction_options_fifo, [
+            {max_table_files_size, 1048576},
+            {max_data_files_size, 4194304},
+            {use_kv_ratio_compaction, true}
+        ]}
+    ]
+  ),
+  [ok = rocksdb:put(Db, <<I:32>>, <<I:32>>, []) || I <- lists:seq(1, 100)],
+  {ok, <<1:32>>} = rocksdb:get(Db, <<1:32>>, []),
+  ok = rocksdb:close(Db),
+  rocksdb:destroy(DbName, []),
+  ?rm_rf(DbName).
 
 test_with_ttl(TTL) ->
   TTLAsList = integer_to_list(TTL),
@@ -93,4 +130,3 @@ test_with_ttl(TTL) ->
   ?assertMatch({match, _}, re:run(Log0, lists:concat(["Options.ttl: ",TTLAsList]))),
   ok = rocksdb:close(Db),
   ?rm_rf(DbName).
-

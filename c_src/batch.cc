@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------
-// Copyright (c) 2016-2022 Benoit Chesneau. All Rights Reserved.
+// Copyright (c) 2016-2026 Benoit Chesneau. All Rights Reserved.
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -78,9 +78,25 @@ NewBatch(
         const ERL_NIF_TERM[] /*argv*/)
 {
     rocksdb::WriteBatch* wb = reinterpret_cast<rocksdb::WriteBatch*>(enif_alloc(sizeof(rocksdb::WriteBatch)));
+    if (wb == nullptr)
+        return error_tuple(env, ATOM_ERROR, "out of memory");
+
     Batch* batch = reinterpret_cast<Batch*>(enif_alloc_resource(m_Batch_RESOURCE, sizeof(Batch)));
+    if (batch == nullptr)
+    {
+        enif_free(wb);
+        return error_tuple(env, ATOM_ERROR, "out of memory");
+    }
+
     batch->wb = new(wb) rocksdb::WriteBatch();
     batch->env = enif_alloc_env();
+    if (batch->env == nullptr)
+    {
+        batch->wb->~WriteBatch();
+        enif_free(wb);
+        enif_release_resource(batch);
+        return error_tuple(env, ATOM_ERROR, "out of memory");
+    }
     ERL_NIF_TERM result = enif_make_resource(env, batch);
     enif_release_resource(batch);
     return enif_make_tuple2(env, ATOM_OK, result);
@@ -299,6 +315,55 @@ SingleDeleteBatch(
     return ATOM_OK;
 }
 
+ERL_NIF_TERM
+DeleteRangeBatch(
+        ErlNifEnv* env,
+        int argc,
+        const ERL_NIF_TERM argv[])
+{
+    rocksdb::WriteBatch* wb = nullptr;
+    Batch* batch_ptr = nullptr;
+    ReferencePtr<erocksdb::ColumnFamilyObject> cf_ptr;
+    rocksdb::Slice begin;
+    rocksdb::Slice end;
+
+    if(!enif_get_resource(env, argv[0], m_Batch_RESOURCE, (void **) &batch_ptr))
+        return enif_make_badarg(env);
+    wb = batch_ptr->wb;
+
+    if (argc > 3)
+    {
+        if(!enif_get_cf(env, argv[1], &cf_ptr))
+            return enif_make_badarg(env);
+
+        if (!binary_to_slice(env, argv[2], &begin))
+            return enif_make_badarg(env);
+
+        if (!binary_to_slice(env, argv[3], &end))
+            return enif_make_badarg(env);
+
+        enif_make_copy(batch_ptr->env, argv[2]);
+        enif_make_copy(batch_ptr->env, argv[3]);
+
+        erocksdb::ColumnFamilyObject* cf = cf_ptr.get();
+        wb->DeleteRange(cf->m_ColumnFamily, begin, end);
+    }
+    else
+    {
+        if (!binary_to_slice(env, argv[1], &begin))
+            return enif_make_badarg(env);
+
+        if (!binary_to_slice(env, argv[2], &end))
+            return enif_make_badarg(env);
+
+        enif_make_copy(batch_ptr->env, argv[1]);
+        enif_make_copy(batch_ptr->env, argv[2]);
+
+        wb->DeleteRange(begin, end);
+    }
+
+    return ATOM_OK;
+}
 
 
 ERL_NIF_TERM

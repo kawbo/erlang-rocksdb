@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "rocksdb/sst_file_reader.h"
 
 #include <cinttypes>
@@ -165,7 +164,7 @@ TEST_F(SstFileReaderTest, ReadFileWithGlobalSeqno) {
   Options options;
   options.create_if_missing = true;
   std::string db_name = test::PerThreadDBPath("test_db");
-  DB* db;
+  std::unique_ptr<DB> db;
   ASSERT_OK(DB::Open(options, db_name, &db));
   // Bump sequence number.
   ASSERT_OK(db->Put(WriteOptions(), keys[0], "foo"));
@@ -187,7 +186,7 @@ TEST_F(SstFileReaderTest, ReadFileWithGlobalSeqno) {
     }
   }
   ASSERT_FALSE(ingested_file.empty());
-  delete db;
+  db.reset();
 
   // Verify the file can be open and read by SstFileReader.
   CheckFile(db_name + ingested_file, keys, true /* check_global_seqno */);
@@ -769,6 +768,105 @@ TEST_F(SstFileReaderTableIteratorTest, UserDefinedTimestampsEnabled) {
   Close();
 }
 
+class SstFileReaderTableGetTest : public DBTestBase,
+                                  public testing::WithParamInterface<bool> {
+ public:
+  SstFileReaderTableGetTest()
+      : DBTestBase("sst_file_reader_table_get_test",
+                   /*env_do_fsync=*/false) {}
+
+  bool UseMultiGet() const { return GetParam(); }
+
+  std::vector<Status> DoGet(SstFileReader& reader,
+                            const std::vector<Slice>& keys,
+                            std::vector<std::string>* values) {
+    if (UseMultiGet()) {
+      return reader.MultiGet(ReadOptions(), keys, values);
+    } else {
+      values->resize(keys.size());
+      std::vector<Status> statuses(keys.size());
+      for (size_t i = 0; i < keys.size(); ++i) {
+        statuses[i] = reader.Get(ReadOptions(), keys[i], &(*values)[i]);
+      }
+      return statuses;
+    }
+  }
+};
+
+TEST_P(SstFileReaderTableGetTest, Basic) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  options.statistics = CreateDBStatistics();
+  BlockBasedTableOptions bbto;
+  bbto.filter_policy.reset(NewBloomFilterPolicy(10, false));
+  options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("foo", "val1"));
+  const Snapshot* snapshot1 = dbfull()->GetSnapshot();
+  ASSERT_OK(Delete("foo"));
+  ASSERT_OK(Delete("bar"));
+  const Snapshot* snapshot2 = dbfull()->GetSnapshot();
+  ASSERT_OK(Put("bar", "val2"));
+  ASSERT_OK(Put("baz", "val3"));
+  ASSERT_OK(Put("aaa", "val4"));
+  const Snapshot* snapshot3 = dbfull()->GetSnapshot();
+  ASSERT_OK(Merge("aaa", "val5"));
+
+  ASSERT_OK(Flush());
+
+  std::vector<LiveFileMetaData> files;
+  dbfull()->GetLiveFilesMetaData(&files);
+  ASSERT_EQ(files.size(), 1);
+  ASSERT_TRUE(files[0].level == 0);
+  std::string file_name = files[0].directory + "/" + files[0].relative_filename;
+
+  SstFileReader reader(options);
+  ASSERT_OK(reader.Open(file_name));
+  ASSERT_OK(reader.VerifyChecksum());
+
+  ASSERT_OK(options.statistics->Reset());
+
+  std::vector<Slice> keys = {"fo1", "foo", "baz",
+                             "bar", "aaa", "zzz_not_in_sst"};
+  std::vector<std::string> values;
+  auto statuses = DoGet(reader, keys, &values);
+
+  // Non-existent key returns NotFound
+  ASSERT_TRUE(statuses[0].IsNotFound());
+
+  // Deleted key returns NotFound
+  ASSERT_TRUE(statuses[1].IsNotFound());
+
+  // Found keys
+  ASSERT_OK(statuses[2]);
+  ASSERT_EQ(values[2], "val3");
+
+  ASSERT_OK(statuses[3]);
+  ASSERT_EQ(values[3], "val2");
+
+  // Merged key
+  ASSERT_OK(statuses[4]);
+  ASSERT_EQ(values[4], "val4,val5");
+
+  // Bloom filter filtered key
+  ASSERT_TRUE(statuses[5].IsNotFound());
+
+  uint64_t cache_hits = options.statistics->getTickerCount(BLOCK_CACHE_HIT);
+  uint64_t cache_misses = options.statistics->getTickerCount(BLOCK_CACHE_MISS);
+  ASSERT_GT(cache_hits + cache_misses, 0);
+
+  dbfull()->ReleaseSnapshot(snapshot1);
+  dbfull()->ReleaseSnapshot(snapshot2);
+  dbfull()->ReleaseSnapshot(snapshot3);
+  Close();
+}
+
+INSTANTIATE_TEST_CASE_P(SingleAndMulti, SstFileReaderTableGetTest,
+                        testing::Bool());
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
@@ -777,4 +875,3 @@ int main(int argc, char** argv) {
   RegisterCustomObjects(argc, argv);
   return RUN_ALL_TESTS();
 }
-

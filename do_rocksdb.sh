@@ -1,20 +1,13 @@
-#!/bin/sh
-
-set -eu
-set -x
-
-if ./do_prebuilt.sh; then
-    exit 0
-else
-    echo "No prebuilt artifacts, building from source"
-fi
+#!/bin/sh -x
 
 cd _build/cmake
 
-if type cmake3 > /dev/null 2>&1 ; then
-    CMAKE=cmake3
-else
-    CMAKE=cmake
+if [ -z "$CMAKE" ]; then
+    if type cmake3 > /dev/null 2>&1 ; then
+        CMAKE=cmake3
+    else
+        CMAKE=cmake
+    fi
 fi
 
 case "$@" in
@@ -33,24 +26,4 @@ case "$@" in
         ;;
 esac
 
-cd ../../
-
-PKGNAME="$(./pkgname.sh)"
-
-if [ "${BUILD_RELEASE:-}" = 1 ]; then
-    if [ -z "$PKGNAME" ]; then
-        echo "unable_to_resolve_release_package_name"
-        exit 1
-    fi
-    mkdir -p _packages
-    TARGET="_packages/${PKGNAME}"
-    gzip -c 'priv/liberocksdb.so' > "$TARGET"
-    # use openssl but not sha256sum command because in some macos env it does not exist
-    if command -v openssl; then
-        openssl dgst -sha256 "${TARGET}" | cut -d ' ' -f 2  > "${TARGET}.sha256"
-    else
-        sha256sum "${TARGET}"  | cut -d ' ' -f 1 > "${TARGET}.sha256"
-    fi
-fi
-
-echo done_building_rocksdb
+echo done.
