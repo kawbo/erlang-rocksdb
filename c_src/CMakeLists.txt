@@ -109,6 +109,15 @@ set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
 # OpenSSL provides the AES-256 block transform used by the encrypted env.
+# On macOS, Homebrew's openssl@3 is keg-only, so it is not in the default prefix paths.
+if(APPLE AND NOT OPENSSL_ROOT_DIR AND NOT DEFINED ENV{OPENSSL_ROOT_DIR})
+    foreach(dir /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3 /opt/local)
+        if(EXISTS "${dir}/include/openssl/evp.h")
+            set(OPENSSL_ROOT_DIR "${dir}")
+            break()
+        endif()
+    endforeach()
+endif()
 find_package(OpenSSL REQUIRED)
 
 option(WITH_CCACHE "Build with ccache." OFF)
